@@ -1,0 +1,221 @@
+"""
+LibreOffice UNO 重算引擎
+負責：開啟商品範本 xlsx -> 寫入客戶輸入 -> calculateAll() -> 讀出結果表 -> (可選)匯出 PDF
+"""
+import os
+import shutil
+import tempfile
+import time
+import uno
+from com.sun.star.beans import PropertyValue
+
+UNO_HOST = os.environ.get("UNO_HOST", "localhost")
+UNO_PORT = os.environ.get("UNO_PORT", "2002")
+
+TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "templates")
+
+# 各商品代碼對應的範本檔案（PFA3/PFA6 共用同一份範本，用繳費年期欄位區分）
+PRODUCT_TEMPLATE = {
+    "PFA3": "PFA.xlsx",
+    "PFA6": "PFA.xlsx",
+}
+
+# 注意：三個情境表格的代號雖是 H/M/L，但不是「紅利由高到低」的意思，
+# 而是台灣保險局要求分紅保單揭露的三種法定情境（依 OP!B173:B175 定義）：
+#   H (總表_分紅_H) = 假設分紅金額可能為零（最保守揭露情境，早年通常為0）
+#   M (總表_分紅_M) = 最可能紅利（業務員一般引用的主情境）
+#   L (總表_分紅_L) = 較低紅利
+# 三張表一律會同時算出，跟 輸入頁!E23（計算預估紅利）的選擇無關；
+# E23 只決定「列印頁」PDF 上要標示/主打哪一個情境。
+RESULT_SHEETS = {
+    "zero_possible": {"sheet": "總表_分紅_H", "label": "假設分紅金額可能為零"},
+    "most_likely": {"sheet": "總表_分紅_M", "label": "最可能紅利"},
+    "lower": {"sheet": "總表_分紅_L", "label": "較低紅利"},
+}
+
+# 總表_分紅_x 的欄位對照（依實際 xlsx 表頭確認）
+COLUMN_MAP = [
+    ("policy_year", "B"),      # 保單年度
+    ("age", "C"),               # 保險年齡
+    ("annual_premium", "D"),    # 年度實繳保費(已扣除年度保單紅利)
+    ("cum_premium", "E"),       # 累計實繳保費
+    ("survival_benefit", "F"),  # 生存保險金
+    ("cum_survival_benefit", "G"),  # 累計已領生存保險金
+    ("death_benefit", "H"),     # 年度末 身故/完全失能保障
+    ("cash_value", "I"),        # 年度末 解約金
+    ("reduced_paid_up", "J"),   # 年度末 減額繳清保險金額
+    ("annual_dividend", "K"),   # 年度末 年度保單紅利
+    ("paid_up_amount", "M"),    # 年度末 繳清保險金額
+    ("total_amount", "N"),      # 年度末 保險金額
+]
+
+DATA_ROW_START = 5
+DATA_ROW_END = 115  # 對應 named range TOV_BONU_M!B5:AG115
+
+
+def _mkprop(name, value):
+    p = PropertyValue()
+    p.Name = name
+    p.Value = value
+    return p
+
+
+def _connect(retries=10, delay=1.0):
+    local_ctx = uno.getComponentContext()
+    resolver = local_ctx.ServiceManager.createInstanceWithContext(
+        "com.sun.star.bridge.UnoUrlResolver", local_ctx)
+    last_err = None
+    for _ in range(retries):
+        try:
+            ctx = resolver.resolve(
+                f"uno:socket,host={UNO_HOST},port={UNO_PORT};urp;StarOffice.ComponentContext")
+            smgr = ctx.ServiceManager
+            desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
+            return desktop
+        except Exception as e:
+            last_err = e
+            time.sleep(delay)
+    raise RuntimeError(f"無法連線 LibreOffice UNO ({UNO_HOST}:{UNO_PORT}): {last_err}")
+
+
+def _roc_birth_int(birth_year, birth_month, birth_day):
+    """把民國生日組成輸入頁!E8 需要的整數格式，例如 110年01月01日 -> 1100101"""
+    return int(f"{birth_year}{birth_month:02d}{birth_day:02d}")
+
+
+def _read_error(cell):
+    try:
+        return cell.getError()
+    except Exception:
+        return 0
+
+
+class CalcError(Exception):
+    pass
+
+
+def calculate(product_code: str, inputs: dict, want_pdf: bool = False):
+    """
+    inputs 需包含：
+      name (str)
+      gender ("男"/"女")
+      birth_year / birth_month / birth_day  (民國年/月/日)
+      payment_term (3 或 6)
+      payment_freq ("年繳"/"半年繳"/"季繳"/"月繳")
+      dividend_scenario ("高分紅"/"中分紅"/"低分紅")
+      input_mode ("face_amount" 或 "premium")
+      face_amount_wan (input_mode=face_amount 時必填，單位：萬元)
+      premium_amount (input_mode=premium 時必填，單位：元)
+      death_benefit_pct (0~100，預設0)
+      installment_period (10 或 20，預設20)
+      relationship (預設 "同被保險人")
+      discount (預設 "無")
+    """
+    template_name = PRODUCT_TEMPLATE.get(product_code)
+    if not template_name:
+        raise CalcError(f"未支援的商品代碼: {product_code}")
+
+    src_path = os.path.join(TEMPLATE_DIR, template_name)
+    if not os.path.exists(src_path):
+        raise CalcError(f"找不到範本檔案: {template_name}")
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", dir="/tmp")
+    os.close(fd)
+    shutil.copyfile(src_path, tmp_path)
+
+    desktop = _connect()
+    url = "file://" + tmp_path
+    props = [_mkprop("Hidden", True)]
+    doc = desktop.loadComponentFromURL(url, "_blank", 0, tuple(props))
+
+    try:
+        sheets = doc.getSheets()
+        ip = sheets.getByName("輸入頁")
+        op = sheets.getByName("OP")
+
+        ip.getCellRangeByName("E5").setString(inputs.get("name", "客戶"))
+        ip.getCellRangeByName("K5").setString(inputs["gender"])
+        ip.getCellRangeByName("E8").setValue(
+            _roc_birth_int(int(inputs["birth_year"]), int(inputs["birth_month"]), int(inputs["birth_day"]))
+        )
+        ip.getCellRangeByName("E37").setValue(int(inputs["payment_term"]))
+        ip.getCellRangeByName("E17").setString(inputs.get("payment_freq", "年繳"))
+        ip.getCellRangeByName("E23").setString(inputs.get("dividend_scenario", "中分紅"))
+        ip.getCellRangeByName("E12").setString(inputs.get("relationship", "同被保險人"))
+        ip.getCellRangeByName("E21").setString(inputs.get("discount", "無"))
+
+        death_pct = float(inputs.get("death_benefit_pct", 0) or 0) / 100.0
+        ip.getCellRangeByName("G28").setValue(death_pct)
+        if death_pct > 0:
+            ip.getCellRangeByName("G32").setValue(int(inputs.get("installment_period", 20)))
+
+        input_mode = inputs.get("input_mode", "face_amount")
+        if input_mode == "premium":
+            # 第一輪：用保費試算換算保額（OP!C62），再用換算後的保額做正式試算
+            premium = float(inputs["premium_amount"])
+            ip.getCellRangeByName("E55").setValue(premium)
+            # 先給一個暫定保額讓公式鏈不報錯，再重算讀出換算值
+            ip.getCellRangeByName("J39").setValue(30)
+            doc.calculateAll()
+            converted = op.getCellRangeByName("C62").getValue()
+            if not converted or converted <= 0:
+                raise CalcError("保費換算保額失敗，請確認輸入的保費金額")
+            ip.getCellRangeByName("J39").setValue(converted)
+        else:
+            face_amount = float(inputs["face_amount_wan"])
+            ip.getCellRangeByName("J39").setValue(face_amount)
+
+        doc.calculateAll()
+
+        # 檢核錯誤
+        err_cell = ip.getCellRangeByName("E9")
+        check_text = err_cell.getString()
+
+        premiums = {
+            "first_period_premium": op.getCellRangeByName("C48").getValue(),
+            "renewal_period_premium": op.getCellRangeByName("C49").getValue(),
+            "first_year_premium": op.getCellRangeByName("C51").getValue(),
+            "renewal_year_premium": op.getCellRangeByName("C52").getValue(),
+            "final_face_amount_wan": op.getCellRangeByName("C28").getValue(),
+        }
+
+        tables = {}
+        for key, meta in RESULT_SHEETS.items():
+            sheet_name = meta["sheet"]
+            sheet = sheets.getByName(sheet_name)
+            rows = []
+            for r in range(DATA_ROW_START, DATA_ROW_END + 1):
+                b_val = sheet.getCellRangeByName(f"B{r}").getString()
+                if b_val == "":
+                    break
+                row = {}
+                for field, col in COLUMN_MAP:
+                    c = sheet.getCellRangeByName(f"{col}{r}")
+                    row[field] = c.getValue() if c.getString() != "" else None
+                rows.append(row)
+            tables[key] = {"label": meta["label"], "rows": rows}
+
+        pdf_path = None
+        if want_pdf:
+            fd2, pdf_path = tempfile.mkstemp(suffix=".pdf", dir="/tmp")
+            os.close(fd2)
+            controller = doc.getCurrentController()
+            print_sheet = sheets.getByName("列印頁")
+            controller.setActiveSheet(print_sheet)
+            export_props = [
+                _mkprop("FilterName", "calc_pdf_Export"),
+                _mkprop("SelectionOnly", False),
+            ]
+            doc.storeToURL("file://" + pdf_path, tuple(export_props))
+
+        return {
+            "check_message": check_text,
+            "premiums": premiums,
+            "tables": tables,
+        }, pdf_path
+    finally:
+        doc.close(False)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
