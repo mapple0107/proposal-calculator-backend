@@ -23,7 +23,11 @@ def calculate(product_code):
 
     data = request.get_json(force=True, silent=True) or {}
 
-    required = ["gender", "birth_year", "birth_month", "birth_day", "payment_term"]
+    family = uno_engine.PRODUCT_FAMILY.get(product_code)
+    if family == "CANCER":
+        required = ["birth_year", "birth_month", "birth_day", "payment_term", "face_amount_wan"]
+    else:
+        required = ["gender", "birth_year", "birth_month", "birth_day", "payment_term"]
     missing = [f for f in required if f not in data or data[f] in (None, "")]
     if missing:
         return jsonify({"error": f"缺少必填欄位: {', '.join(missing)}"}), 400

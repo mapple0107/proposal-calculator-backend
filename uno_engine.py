@@ -18,6 +18,16 @@ TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "templates")
 PRODUCT_TEMPLATE = {
     "PFA3": "PFA.xlsx",
     "PFA6": "PFA.xlsx",
+    "CLZ": "CLZ.xlsx",
+    "CLX": "CLX.xlsx",
+}
+
+# 商品家族：決定要用哪一套計算邏輯（輸入欄位對照、輸出表格結構都不同）
+PRODUCT_FAMILY = {
+    "PFA3": "PFA",
+    "PFA6": "PFA",
+    "CLZ": "CANCER",
+    "CLX": "CANCER",
 }
 
 # 注意：三個情境表格的代號雖是 H/M/L，但不是「紅利由高到低」的意思，
@@ -95,6 +105,14 @@ class CalcError(Exception):
 
 
 def calculate(product_code: str, inputs: dict, want_pdf: bool = False):
+    """依商品家族分派到對應的計算函式。"""
+    family = PRODUCT_FAMILY.get(product_code.upper())
+    if family == "CANCER":
+        return calculate_cancer(product_code, inputs, want_pdf=want_pdf)
+    return calculate_pfa(product_code, inputs, want_pdf=want_pdf)
+
+
+def calculate_pfa(product_code: str, inputs: dict, want_pdf: bool = False):
     """
     inputs 需包含：
       name (str)
@@ -218,6 +236,140 @@ def calculate(product_code: str, inputs: dict, want_pdf: bool = False):
             "check_message": check_text,
             "premiums": premiums,
             "tables": tables,
+        }, pdf_path
+    finally:
+        doc.close(False)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+# ============================================================
+# CLZ / CLX 防癌險（無分紅，單純定期還本型健康險）
+# ============================================================
+
+# 列印頁的保單年度明細表分成左右兩個並排區塊（省版面用的排版方式）：
+# 左區塊 B:I 從第1年開始，滿58列後接續右區塊 L:S 到保障期滿為止。
+# 兩區塊要依序串接，才是完整、連續的保單年度明細。
+CANCER_COLUMN_MAP_LEFT = [
+    ("policy_year", "B"),
+    ("age", "C"),
+    ("annual_premium", "D"),
+    ("cum_premium", "F"),
+    ("death_benefit", "I"),
+]
+CANCER_COLUMN_MAP_RIGHT = [
+    ("policy_year", "L"),
+    ("age", "M"),
+    ("annual_premium", "N"),
+    ("cum_premium", "P"),
+    ("death_benefit", "S"),
+]
+CANCER_TABLE_ROW_START = 49
+
+
+def calculate_cancer(product_code: str, inputs: dict, want_pdf: bool = False):
+    """
+    inputs 需包含：
+      name (str)
+      birth_year / birth_month / birth_day（民國年/月/日）
+      relationship（預設 "同被保險人"，選項：同被保險人/與被保險人不同）
+      payment_freq（預設 "年繳"，選項：年繳/半年繳/季繳/月繳）
+      first_payment_method（預設 "金融機構轉帳"，選項：匯款/金融機構轉帳/一般信用卡/富邦信用卡）
+      renewal_payment_method（預設 "金融機構轉帳"，選項：金融機構轉帳/一般信用卡/富邦信用卡/自行繳費）
+      discount（預設 "無"，選項：無/員工轉帳件）
+      payment_term（10 或 20）
+      face_amount_wan（保額，單位：萬元）
+
+    注意：性別（K5）由範本本身固定（CLZ=男 / CLX=女），不開放輸入。
+    """
+    template_name = PRODUCT_TEMPLATE.get(product_code)
+    if not template_name:
+        raise CalcError(f"未支援的商品代碼: {product_code}")
+
+    src_path = os.path.join(TEMPLATE_DIR, template_name)
+    if not os.path.exists(src_path):
+        raise CalcError(f"找不到範本檔案: {template_name}")
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", dir="/tmp")
+    os.close(fd)
+    shutil.copyfile(src_path, tmp_path)
+
+    desktop = _connect()
+    url = "file://" + tmp_path
+    props = [_mkprop("Hidden", True)]
+    doc = desktop.loadComponentFromURL(url, "_blank", 0, tuple(props))
+
+    try:
+        sheets = doc.getSheets()
+        ip = sheets.getByName("輸入頁")
+        op = sheets.getByName("OP")
+
+        ip.getCellRangeByName("E5").setString(inputs.get("name", "客戶"))
+        ip.getCellRangeByName("E7").setValue(
+            _roc_birth_int(int(inputs["birth_year"]), int(inputs["birth_month"]), int(inputs["birth_day"]))
+        )
+        ip.getCellRangeByName("E12").setString(inputs.get("relationship", "同被保險人"))
+        ip.getCellRangeByName("E16").setString(inputs.get("payment_freq", "年繳"))
+        ip.getCellRangeByName("Q16").setString(inputs.get("first_payment_method", "金融機構轉帳"))
+        ip.getCellRangeByName("Q18").setString(inputs.get("renewal_payment_method", "金融機構轉帳"))
+        ip.getCellRangeByName("E19").setString(inputs.get("discount", "無"))
+        ip.getCellRangeByName("D22").setValue(int(inputs["payment_term"]))
+        ip.getCellRangeByName("J24").setValue(float(inputs["face_amount_wan"]))
+
+        doc.calculateAll()
+
+        premiums = {
+            "first_period_premium": op.getCellRangeByName("C48").getValue(),
+            "renewal_period_premium": op.getCellRangeByName("C49").getValue(),
+            "first_year_premium": op.getCellRangeByName("C51").getValue(),
+            "renewal_year_premium": op.getCellRangeByName("C52").getValue(),
+            "final_face_amount_wan": op.getCellRangeByName("C28").getValue(),
+        }
+
+        print_sheet = sheets.getByName("列印頁")
+
+        def is_data_cell(cell):
+            # 資料列的儲存格可能是純數字（VALUE）或公式算出數字（FORMULA），
+            # 表格結束後接的是文字註腳（TEXT，非公式）或真正空白（EMPTY）、
+            # 或是公式算出空字串（FORMULA 但字串為空）——這幾種都視為「結束」。
+            return cell.getType().value != "TEXT" and cell.getString().strip() != ""
+
+        def read_block(column_map, first_col):
+            block_rows = []
+            r = CANCER_TABLE_ROW_START
+            while True:
+                first_cell = print_sheet.getCellRangeByName(f"{first_col}{r}")
+                if not is_data_cell(first_cell):
+                    break
+                row = {}
+                for field, col in column_map:
+                    c = print_sheet.getCellRangeByName(f"{col}{r}")
+                    row[field] = c.getValue() if is_data_cell(c) else None
+                block_rows.append(row)
+                r += 1
+                if r > CANCER_TABLE_ROW_START + 100:  # 安全上限，避免異常時無窮迴圈
+                    break
+            return block_rows
+
+        rows = read_block(CANCER_COLUMN_MAP_LEFT, "B") + read_block(CANCER_COLUMN_MAP_RIGHT, "L")
+
+        pdf_path = None
+        if want_pdf:
+            fd2, pdf_path = tempfile.mkstemp(suffix=".pdf", dir="/tmp")
+            os.close(fd2)
+            controller = doc.getCurrentController()
+            controller.setActiveSheet(print_sheet)
+            export_props = [
+                _mkprop("FilterName", "calc_pdf_Export"),
+                _mkprop("SelectionOnly", False),
+            ]
+            doc.storeToURL("file://" + pdf_path, tuple(export_props))
+
+        return {
+            "premiums": premiums,
+            "tables": {"main": {"label": "保單年度明細", "rows": rows}},
         }, pdf_path
     finally:
         doc.close(False)
