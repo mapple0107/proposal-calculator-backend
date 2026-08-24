@@ -361,9 +361,22 @@ def calculate_cancer(product_code: str, inputs: dict, want_pdf: bool = False):
             os.close(fd2)
             controller = doc.getCurrentController()
             controller.setActiveSheet(print_sheet)
+            # 原始模板在 100% 縮放下欄位寬度超出單頁可印範圍，導致最右側欄位（如「說明」）
+            # 文字被裁切、內容卡到旁邊的頁面。改為「縮放至頁寬 1 頁」，高度不限頁數，
+            # 讓整張表自動等比縮小以完整印在一頁寬度內。
+            style_name = print_sheet.PageStyle
+            page_style = doc.getStyleFamilies().getByName("PageStyles").getByName(style_name)
+            page_style.ScaleToPagesX = 1
+            page_style.ScaleToPagesY = 0
+            # 跳過第1頁（封面/基本資料摘要頁），PDF 直接從投保利益表開始
+            filter_data = uno.Any(
+                "[]com.sun.star.beans.PropertyValue",
+                (_mkprop("PageRange", "2-"),),
+            )
             export_props = [
                 _mkprop("FilterName", "calc_pdf_Export"),
                 _mkprop("SelectionOnly", False),
+                _mkprop("FilterData", filter_data),
             ]
             doc.storeToURL("file://" + pdf_path, tuple(export_props))
 
