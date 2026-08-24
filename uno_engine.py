@@ -202,9 +202,15 @@ def calculate(product_code: str, inputs: dict, want_pdf: bool = False):
             controller = doc.getCurrentController()
             print_sheet = sheets.getByName("列印頁")
             controller.setActiveSheet(print_sheet)
+            # 跳過第1頁（封面/基本資料摘要頁），PDF 直接從分紅保單利益彙總表開始
+            filter_data = uno.Any(
+                "[]com.sun.star.beans.PropertyValue",
+                (_mkprop("PageRange", "2-"),),
+            )
             export_props = [
                 _mkprop("FilterName", "calc_pdf_Export"),
                 _mkprop("SelectionOnly", False),
+                _mkprop("FilterData", filter_data),
             ]
             doc.storeToURL("file://" + pdf_path, tuple(export_props))
 
