@@ -326,6 +326,9 @@ def calculate_cancer(product_code: str, inputs: dict, want_pdf: bool = False):
             "first_year_premium": op.getCellRangeByName("C51").getValue(),
             "renewal_year_premium": op.getCellRangeByName("C52").getValue(),
             "final_face_amount_wan": op.getCellRangeByName("C28").getValue(),
+            # 折扣前的應繳保費（依所選繳別換算，年繳時即為年繳保費），對應官方 PDF 上方
+            # 「＿繳應繳保費/元」欄位，與已扣除折扣的 first_period_premium 不同。
+            "annual_premium_gross": op.getCellRangeByName("C35").getValue(),
         }
 
         print_sheet = sheets.getByName("列印頁")
