@@ -347,7 +347,18 @@ def calculate_cancer(product_code: str, inputs: dict, want_pdf: bool = False):
             # 資料列的儲存格可能是純數字（VALUE）或公式算出數字（FORMULA），
             # 表格結束後接的是文字註腳（TEXT，非公式）或真正空白（EMPTY）、
             # 或是公式算出空字串（FORMULA 但字串為空）——這幾種都視為「結束」。
-            return cell.getType().value != "TEXT" and cell.getString().strip() != ""
+            # 但有些頁尾免責聲明文字也是「公式算出字串」（型別顯示為 FORMULA 而非
+            # TEXT，例如"本建議書僅供參考..."），字串非空所以會被誤判成資料列，
+            # 讀出來的 getValue() 又預設回傳 0，導致表格中間混入一列全部是 0 的
+            # 假資料。修正：資料列的顯示字串必須能還原成與 getValue() 相符的數字，
+            # 否則視為非資料列。
+            s = cell.getString().strip()
+            if s == "" or cell.getType().value == "TEXT":
+                return False
+            try:
+                return float(s.replace(",", "")) == cell.getValue()
+            except ValueError:
+                return False
 
         def read_block(column_map, first_col):
             block_rows = []
@@ -491,7 +502,15 @@ def calculate_lts(product_code: str, inputs: dict, want_pdf: bool = False):
         print_sheet = sheets.getByName("列印頁")
 
         def is_data_cell(cell):
-            return cell.getType().value != "TEXT" and cell.getString().strip() != ""
+            # 同 CANCER：排除「型別顯示為 FORMULA、但實際算出的是文字（如頁尾
+            # 免責聲明）」的儲存格，避免被誤判成數值資料列（見上方註解）。
+            s = cell.getString().strip()
+            if s == "" or cell.getType().value == "TEXT":
+                return False
+            try:
+                return float(s.replace(",", "")) == cell.getValue()
+            except ValueError:
+                return False
 
         rows = []
         if insurance_age and insurance_age > 0:
@@ -651,7 +670,15 @@ def calculate_ltqt(product_code: str, inputs: dict, want_pdf: bool = False):
         tov_sheet = sheets.getByName("總表")
 
         def is_data_cell(cell):
-            return cell.getType().value != "TEXT" and cell.getString().strip() != ""
+            # 同 CANCER：排除「型別顯示為 FORMULA、但實際算出的是文字（如頁尾
+            # 免責聲明）」的儲存格，避免被誤判成數值資料列（見上方註解）。
+            s = cell.getString().strip()
+            if s == "" or cell.getType().value == "TEXT":
+                return False
+            try:
+                return float(s.replace(",", "")) == cell.getValue()
+            except ValueError:
+                return False
 
         def cell_value_or_none(cell):
             # 有些欄位（如解約金/減額繳清）在此商品設計上永遠是 #N/A（無此項目），
