@@ -21,6 +21,8 @@ PRODUCT_TEMPLATE = {
     "CLZ": "CLZ.xlsx",
     "CLX": "CLX.xlsx",
     "LTS": "LTS.xlsx",
+    "LTQ": "LTQ.xlsx",
+    "LTT": "LTT.xlsx",
 }
 
 # 商品家族：決定要用哪一套計算邏輯（輸入欄位對照、輸出表格結構都不同）
@@ -30,6 +32,8 @@ PRODUCT_FAMILY = {
     "CLZ": "CANCER",
     "CLX": "CANCER",
     "LTS": "LTS",
+    "LTQ": "LTQT",
+    "LTT": "LTQT",
 }
 
 # 注意：三個情境表格的代號雖是 H/M/L，但不是「紅利由高到低」的意思，
@@ -113,6 +117,8 @@ def calculate(product_code: str, inputs: dict, want_pdf: bool = False):
         return calculate_cancer(product_code, inputs, want_pdf=want_pdf)
     if family == "LTS":
         return calculate_lts(product_code, inputs, want_pdf=want_pdf)
+    if family == "LTQT":
+        return calculate_ltqt(product_code, inputs, want_pdf=want_pdf)
     return calculate_pfa(product_code, inputs, want_pdf=want_pdf)
 
 
@@ -516,6 +522,168 @@ def calculate_lts(product_code: str, inputs: dict, want_pdf: bool = False):
             page_style.ScaleToPagesX = 1
             page_style.ScaleToPagesY = 0
             # 跳過第1頁（封面/基本資料摘要頁），PDF 直接從投保利益表開始
+            filter_data = uno.Any(
+                "[]com.sun.star.beans.PropertyValue",
+                (_mkprop("PageRange", "2-"),),
+            )
+            export_props = [
+                _mkprop("FilterName", "calc_pdf_Export"),
+                _mkprop("SelectionOnly", False),
+                _mkprop("FilterData", filter_data),
+            ]
+            doc.storeToURL("file://" + pdf_path, tuple(export_props))
+
+        return {
+            "premiums": premiums,
+            "tables": {"main": {"label": "保單年度明細", "rows": rows}},
+        }, pdf_path
+    finally:
+        doc.close(False)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# LTQ（連馨久久）/ LTT（順馨久久）長期照顧終身健康保險 —— 分紅保單
+# ---------------------------------------------------------------------------
+# 結構特點（與 LTS 不同）：
+#   - 輸入頁多了「年度保單紅利給付方式」(E19：儲存生息/現金給付) 與「身故保障
+#     分期給付」進階選項 (G26 指定比例、G30 分期年期)，兩者皆非必填，預設為
+#     現金給付 / 比例0%（=完全一次給付，不啟用分期）。
+#   - 範本內建「雙被保險人」欄位與 OP!B2 二人共保開關，但 OP!B2 是寫死的常數
+#     1（單一被保險人），並未被 輸入頁 任何欄位連動改寫，因此本工具沿用與
+#     LTS/CLZ 相同的「僅支援單一被保險人」範圍，不處理被保險人2 欄位。
+#   - 年度明細表改讀「總表」工作表（非 列印頁），因為 列印頁 在這個商品是
+#     很長的「保單條款式」給付說明頁（老年住院醫療/完全失能/長期照顧/意外
+#     /重大疾病等多組小表格交錯），並非單一連續的年度數字表；「總表」才是
+#     單一、連續、對應 named range TOV（總表!B3:AI114）的年度數字來源，
+#     且欄位固定不含表頭重複列問題，所以只需從第4列開始逐列讀到出現空列
+#     （B欄公式在超過保障年齡後回傳空字串）即可停止，不需要 LTS 那套
+#     「算出預期列數」的技巧。
+# 注意：LTQ/LTT 的 列印頁 明確聲明「本保險因費率計算已考慮脫退率，故本保險
+# 無解約金」，故「總表」I欄(解約金)/J欄(減額繳清保險金額)在此二商品實際上
+# 永遠是 #N/A（無對應之精算資料表），不是計算錯誤，是商品設計本身無此項目，
+# 因此摘要表不納入這兩欄，只保留有意義的保費與身故保障欄位。
+LTQT_COLUMN_MAP = [
+    ("policy_year", "B"),   # 保單年度
+    ("age", "C"),           # 保險年齡
+    ("annual_premium", "D"),  # 年度實繳保費
+    ("cum_premium", "E"),     # 累計實繳保費
+    ("death_benefit", "H"),   # 年度末 身故/完全失能保障
+]
+LTQT_TABLE_ROW_START = 4
+LTQT_TABLE_ROW_END = 114  # 總表 named range TOV 上限 (總表!B3:AI114)
+
+
+def calculate_ltqt(product_code: str, inputs: dict, want_pdf: bool = False):
+    """
+    inputs 需包含：
+      name (str)
+      gender（"男"/"女"）
+      birth_year / birth_month / birth_day（民國年/月/日）
+      relationship（預設 "同被保險人"）
+      payment_freq（預設 "年繳"，選項：年繳/半年繳/季繳/月繳）
+      first_payment_method / renewal_payment_method（預設 "金融機構轉帳"）
+      dividend_payout_method（預設 "現金給付"，選項：儲存生息/現金給付）
+      discount（預設 "無"）
+      payment_term（10 / 20 / 30）
+      face_amount_wan（保額，單位：萬元）
+      installment_ratio（選填，預設 0，指定保險金分期給付比例 0~100）
+      installment_period（選填，預設 10，分期給付期間，選項 10/20）
+    """
+    template_name = PRODUCT_TEMPLATE.get(product_code)
+    if not template_name:
+        raise CalcError(f"未支援的商品代碼: {product_code}")
+
+    src_path = os.path.join(TEMPLATE_DIR, template_name)
+    if not os.path.exists(src_path):
+        raise CalcError(f"找不到範本檔案: {template_name}")
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", dir="/tmp")
+    os.close(fd)
+    shutil.copyfile(src_path, tmp_path)
+
+    desktop = _connect()
+    url = "file://" + tmp_path
+    props = [_mkprop("Hidden", True)]
+    doc = desktop.loadComponentFromURL(url, "_blank", 0, tuple(props))
+
+    try:
+        sheets = doc.getSheets()
+        ip = sheets.getByName("輸入頁")
+        op = sheets.getByName("OP")
+
+        ip.getCellRangeByName("E5").setString(inputs.get("name", "客戶"))
+        ip.getCellRangeByName("K5").setString(inputs.get("gender", "女"))
+        ip.getCellRangeByName("N5").setValue(
+            _roc_birth_int(int(inputs["birth_year"]), int(inputs["birth_month"]), int(inputs["birth_day"]))
+        )
+        ip.getCellRangeByName("E12").setString(inputs.get("relationship", "同被保險人"))
+        ip.getCellRangeByName("E17").setString(inputs.get("payment_freq", "年繳"))
+        ip.getCellRangeByName("Q17").setString(inputs.get("first_payment_method", "金融機構轉帳"))
+        ip.getCellRangeByName("Q19").setString(inputs.get("renewal_payment_method", "金融機構轉帳"))
+        ip.getCellRangeByName("E19").setString(inputs.get("dividend_payout_method", "現金給付"))
+        ip.getCellRangeByName("E21").setString(inputs.get("discount", "無"))
+        ip.getCellRangeByName("E37").setValue(int(inputs["payment_term"]))
+        ip.getCellRangeByName("J39").setValue(float(inputs["face_amount_wan"]))
+
+        installment_ratio = inputs.get("installment_ratio")
+        ip.getCellRangeByName("G26").setValue(float(installment_ratio) if installment_ratio not in (None, "") else 0)
+        installment_period = inputs.get("installment_period")
+        ip.getCellRangeByName("G30").setValue(int(installment_period) if installment_period not in (None, "") else 10)
+
+        doc.calculateAll()
+
+        insurance_age = op.getCellRangeByName("D5").getValue()
+
+        premiums = {
+            "first_period_premium": op.getCellRangeByName("C48").getValue(),
+            "renewal_period_premium": op.getCellRangeByName("C49").getValue(),
+            "first_year_premium": op.getCellRangeByName("C51").getValue(),
+            "renewal_year_premium": op.getCellRangeByName("C52").getValue(),
+            "final_face_amount_wan": op.getCellRangeByName("C28").getValue(),
+            "annual_premium_gross": op.getCellRangeByName("C35").getValue(),
+            "insurance_age": insurance_age,
+        }
+
+        tov_sheet = sheets.getByName("總表")
+
+        def is_data_cell(cell):
+            return cell.getType().value != "TEXT" and cell.getString().strip() != ""
+
+        def cell_value_or_none(cell):
+            # 有些欄位（如解約金/減額繳清）在此商品設計上永遠是 #N/A（無此項目），
+            # getValue() 對錯誤儲存格預設回傳 0，會誤導成「金額為0」，故明確排除。
+            if _read_error(cell) != 0:
+                return None
+            return cell.getValue() if is_data_cell(cell) else None
+
+        rows = []
+        for r in range(LTQT_TABLE_ROW_START, LTQT_TABLE_ROW_END + 1):
+            first_cell = tov_sheet.getCellRangeByName(f"B{r}")
+            if not is_data_cell(first_cell):
+                break
+            row = {}
+            for field, col in LTQT_COLUMN_MAP:
+                c = tov_sheet.getCellRangeByName(f"{col}{r}")
+                row[field] = cell_value_or_none(c)
+            rows.append(row)
+
+        pdf_path = None
+        if want_pdf:
+            fd2, pdf_path = tempfile.mkstemp(suffix=".pdf", dir="/tmp")
+            os.close(fd2)
+            print_sheet = sheets.getByName("列印頁")
+            controller = doc.getCurrentController()
+            controller.setActiveSheet(print_sheet)
+            # 同 CLZ/CLX/LTS：原始模板欄寬在 100% 縮放下會超出單頁可印範圍
+            style_name = print_sheet.PageStyle
+            page_style = doc.getStyleFamilies().getByName("PageStyles").getByName(style_name)
+            page_style.ScaleToPagesX = 1
+            page_style.ScaleToPagesY = 0
+            # 跳過第1頁（封面/基本資料摘要頁）
             filter_data = uno.Any(
                 "[]com.sun.star.beans.PropertyValue",
                 (_mkprop("PageRange", "2-"),),
