@@ -20,6 +20,7 @@ PRODUCT_TEMPLATE = {
     "PFA6": "PFA.xlsx",
     "CLZ": "CLZ.xlsx",
     "CLX": "CLX.xlsx",
+    "LTS": "LTS.xlsx",
 }
 
 # 商品家族：決定要用哪一套計算邏輯（輸入欄位對照、輸出表格結構都不同）
@@ -28,6 +29,7 @@ PRODUCT_FAMILY = {
     "PFA6": "PFA",
     "CLZ": "CANCER",
     "CLX": "CANCER",
+    "LTS": "LTS",
 }
 
 # 注意：三個情境表格的代號雖是 H/M/L，但不是「紅利由高到低」的意思，
@@ -109,6 +111,8 @@ def calculate(product_code: str, inputs: dict, want_pdf: bool = False):
     family = PRODUCT_FAMILY.get(product_code.upper())
     if family == "CANCER":
         return calculate_cancer(product_code, inputs, want_pdf=want_pdf)
+    if family == "LTS":
+        return calculate_lts(product_code, inputs, want_pdf=want_pdf)
     return calculate_pfa(product_code, inputs, want_pdf=want_pdf)
 
 
@@ -367,6 +371,146 @@ def calculate_cancer(product_code: str, inputs: dict, want_pdf: bool = False):
             # 原始模板在 100% 縮放下欄位寬度超出單頁可印範圍，導致最右側欄位（如「說明」）
             # 文字被裁切、內容卡到旁邊的頁面。改為「縮放至頁寬 1 頁」，高度不限頁數，
             # 讓整張表自動等比縮小以完整印在一頁寬度內。
+            style_name = print_sheet.PageStyle
+            page_style = doc.getStyleFamilies().getByName("PageStyles").getByName(style_name)
+            page_style.ScaleToPagesX = 1
+            page_style.ScaleToPagesY = 0
+            # 跳過第1頁（封面/基本資料摘要頁），PDF 直接從投保利益表開始
+            filter_data = uno.Any(
+                "[]com.sun.star.beans.PropertyValue",
+                (_mkprop("PageRange", "2-"),),
+            )
+            export_props = [
+                _mkprop("FilterName", "calc_pdf_Export"),
+                _mkprop("SelectionOnly", False),
+                _mkprop("FilterData", filter_data),
+            ]
+            doc.storeToURL("file://" + pdf_path, tuple(export_props))
+
+        return {
+            "premiums": premiums,
+            "tables": {"main": {"label": "保單年度明細", "rows": rows}},
+        }, pdf_path
+    finally:
+        doc.close(False)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+# ============================================================
+# LTS（詠馨久久長期照顧終身壽險）— 單一被保險人、終身（保險年齡屆滿99歲）、
+# 無分紅，年度表含解約金／減額繳清欄位。
+# ============================================================
+LTS_COLUMN_MAP = [
+    ("policy_year", "B"),
+    ("age", "C"),
+    ("annual_premium", "D"),
+    ("cum_premium", "G"),
+    ("death_benefit", "K"),
+    ("cash_value", "O"),          # 年度末解約金
+    ("reduced_paid_up", "S"),     # 年度末減額繳清保險金額
+]
+LTS_TABLE_ROW_START = 56
+LTS_TERMINAL_AGE = 99  # 保障至保險年齡屆滿99歲（終身）
+
+
+def calculate_lts(product_code: str, inputs: dict, want_pdf: bool = False):
+    """
+    inputs 需包含：
+      name (str)
+      gender（"男"/"女"）
+      birth_year / birth_month / birth_day（民國年/月/日）
+      relationship（預設 "同被保險人"，選項：同被保險人/與被保險人不同）
+      payment_freq（預設 "年繳"，選項：年繳/半年繳/季繳/月繳）
+      first_payment_method / renewal_payment_method（預設 "金融機構轉帳"）
+      discount（預設 "無"）
+      payment_term（10 / 20 / 30）
+      face_amount_wan（保額，單位：萬元，範圍依投保年齡約 0.5~5 萬）
+
+    列印頁的年度明細表為單一連續表格（非左右兩欄），但每印表頁會重複表頭列
+    （文字列，非資料列），所以用「已讀到的有效資料列數 == 99 - 保險年齡 + 1」
+    作為停止條件，而不是「遇到非資料列就停止」，否則會被表頭重複列誤判為表尾。
+    """
+    template_name = PRODUCT_TEMPLATE.get(product_code)
+    if not template_name:
+        raise CalcError(f"未支援的商品代碼: {product_code}")
+
+    src_path = os.path.join(TEMPLATE_DIR, template_name)
+    if not os.path.exists(src_path):
+        raise CalcError(f"找不到範本檔案: {template_name}")
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", dir="/tmp")
+    os.close(fd)
+    shutil.copyfile(src_path, tmp_path)
+
+    desktop = _connect()
+    url = "file://" + tmp_path
+    props = [_mkprop("Hidden", True)]
+    doc = desktop.loadComponentFromURL(url, "_blank", 0, tuple(props))
+
+    try:
+        sheets = doc.getSheets()
+        ip = sheets.getByName("輸入頁")
+        op = sheets.getByName("OP")
+
+        ip.getCellRangeByName("E5").setString(inputs.get("name", "客戶"))
+        ip.getCellRangeByName("K5").setString(inputs.get("gender", "女"))
+        ip.getCellRangeByName("E7").setValue(
+            _roc_birth_int(int(inputs["birth_year"]), int(inputs["birth_month"]), int(inputs["birth_day"]))
+        )
+        ip.getCellRangeByName("E12").setString(inputs.get("relationship", "同被保險人"))
+        ip.getCellRangeByName("E16").setString(inputs.get("payment_freq", "年繳"))
+        ip.getCellRangeByName("Q16").setString(inputs.get("first_payment_method", "金融機構轉帳"))
+        ip.getCellRangeByName("Q18").setString(inputs.get("renewal_payment_method", "金融機構轉帳"))
+        ip.getCellRangeByName("E19").setString(inputs.get("discount", "無"))
+        ip.getCellRangeByName("D22").setValue(int(inputs["payment_term"]))
+        ip.getCellRangeByName("J24").setValue(float(inputs["face_amount_wan"]))
+
+        doc.calculateAll()
+
+        insurance_age = op.getCellRangeByName("D5").getValue()
+
+        premiums = {
+            "first_period_premium": op.getCellRangeByName("C48").getValue(),
+            "renewal_period_premium": op.getCellRangeByName("C49").getValue(),
+            "first_year_premium": op.getCellRangeByName("C51").getValue(),
+            "renewal_year_premium": op.getCellRangeByName("C52").getValue(),
+            "final_face_amount_wan": op.getCellRangeByName("C28").getValue(),
+            "annual_premium_gross": op.getCellRangeByName("C35").getValue(),
+            "insurance_age": insurance_age,
+        }
+
+        print_sheet = sheets.getByName("列印頁")
+
+        def is_data_cell(cell):
+            return cell.getType().value != "TEXT" and cell.getString().strip() != ""
+
+        rows = []
+        if insurance_age and insurance_age > 0:
+            expected_years = int(LTS_TERMINAL_AGE - insurance_age + 1)
+            r = LTS_TABLE_ROW_START
+            scanned = 0
+            # 安全上限：正常情況不會超過約 (99-最低承保年齡+1) 列，多留一倍緩衝
+            while len(rows) < expected_years and scanned < 400:
+                first_cell = print_sheet.getCellRangeByName(f"B{r}")
+                if is_data_cell(first_cell):
+                    row = {}
+                    for field, col in LTS_COLUMN_MAP:
+                        c = print_sheet.getCellRangeByName(f"{col}{r}")
+                        row[field] = c.getValue() if is_data_cell(c) else None
+                    rows.append(row)
+                r += 1
+                scanned += 1
+
+        pdf_path = None
+        if want_pdf:
+            fd2, pdf_path = tempfile.mkstemp(suffix=".pdf", dir="/tmp")
+            os.close(fd2)
+            controller = doc.getCurrentController()
+            controller.setActiveSheet(print_sheet)
+            # 同 CLZ/CLX：原始模板欄寬在 100% 縮放下會超出單頁可印範圍，改為縮放至頁寬 1 頁
             style_name = print_sheet.PageStyle
             page_style = doc.getStyleFamilies().getByName("PageStyles").getByName(style_name)
             page_style.ScaleToPagesX = 1
