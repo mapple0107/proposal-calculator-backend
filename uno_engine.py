@@ -23,6 +23,7 @@ PRODUCT_TEMPLATE = {
     "LTS": "LTS.xlsx",
     "LTQ": "LTQ.xlsx",
     "LTT": "LTT.xlsx",
+    "LTP": "LTP.xlsx",
 }
 
 # 商品家族：決定要用哪一套計算邏輯（輸入欄位對照、輸出表格結構都不同）
@@ -34,6 +35,7 @@ PRODUCT_FAMILY = {
     "LTS": "LTS",
     "LTQ": "LTQT",
     "LTT": "LTQT",
+    "LTP": "LTQT",
 }
 
 # 注意：三個情境表格的代號雖是 H/M/L，但不是「紅利由高到低」的意思，
@@ -583,14 +585,20 @@ def calculate_lts(product_code: str, inputs: dict, want_pdf: bool = False):
 #     「算出預期列數」的技巧。
 # 注意：LTQ/LTT 的 列印頁 明確聲明「本保險因費率計算已考慮脫退率，故本保險
 # 無解約金」，故「總表」I欄(解約金)/J欄(減額繳清保險金額)在此二商品實際上
-# 永遠是 #N/A（無對應之精算資料表），不是計算錯誤，是商品設計本身無此項目，
-# 因此摘要表不納入這兩欄，只保留有意義的保費與身故保障欄位。
+# 永遠是 #N/A（無對應之精算資料表），不是計算錯誤，是商品設計本身無此項目。
+# LTP（憶心相守）則相反：其揭露文字是「健康險部分無解約金」，代表主約仍有
+# 解約金，PDATA 的 CV 對照表也確實有完整資料，故 I/J 欄對 LTP 是有意義的
+# 真實數字。三商品共用同一份 COLUMN_MAP，交給 cell_value_or_none() 判斷
+# ——查無資料的商品會自然回傳 None（前端顯示「—」），不需要為每個商品另外
+# 寫一份欄位對照表。
 LTQT_COLUMN_MAP = [
     ("policy_year", "B"),   # 保單年度
     ("age", "C"),           # 保險年齡
     ("annual_premium", "D"),  # 年度實繳保費
     ("cum_premium", "E"),     # 累計實繳保費
     ("death_benefit", "H"),   # 年度末 身故/完全失能保障
+    ("cash_value", "I"),      # 年度末 解約金
+    ("reduced_paid_up", "J"),  # 年度末 減額繳清保險金額
 ]
 LTQT_TABLE_ROW_START = 4
 LTQT_TABLE_ROW_END = 114  # 總表 named range TOV 上限 (總表!B3:AI114)
