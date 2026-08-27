@@ -24,6 +24,10 @@ PRODUCT_TEMPLATE = {
     "LTQ": "LTQ.xlsx",
     "LTT": "LTT.xlsx",
     "LTP": "LTP.xlsx",
+    "SDG": "SDG.xlsx",
+    "SDH": "SDH.xlsx",
+    "SDJ": "SDJ.xlsx",
+    "SDN": "SDN.xlsx",
 }
 
 # 商品家族：決定要用哪一套計算邏輯（輸入欄位對照、輸出表格結構都不同）
@@ -36,6 +40,10 @@ PRODUCT_FAMILY = {
     "LTQ": "LTQT",
     "LTT": "LTQT",
     "LTP": "LTQT",
+    "SDG": "SD",
+    "SDH": "SD",
+    "SDJ": "SD",
+    "SDN": "SD",
 }
 
 # 注意：三個情境表格的代號雖是 H/M/L，但不是「紅利由高到低」的意思，
@@ -121,6 +129,8 @@ def calculate(product_code: str, inputs: dict, want_pdf: bool = False):
         return calculate_lts(product_code, inputs, want_pdf=want_pdf)
     if family == "LTQT":
         return calculate_ltqt(product_code, inputs, want_pdf=want_pdf)
+    if family == "SD":
+        return calculate_sd(product_code, inputs, want_pdf=want_pdf)
     return calculate_pfa(product_code, inputs, want_pdf=want_pdf)
 
 
@@ -714,6 +724,236 @@ def calculate_ltqt(product_code: str, inputs: dict, want_pdf: bool = False):
             controller = doc.getCurrentController()
             controller.setActiveSheet(print_sheet)
             # 同 CLZ/CLX/LTS：原始模板欄寬在 100% 縮放下會超出單頁可印範圍
+            style_name = print_sheet.PageStyle
+            page_style = doc.getStyleFamilies().getByName("PageStyles").getByName(style_name)
+            page_style.ScaleToPagesX = 1
+            page_style.ScaleToPagesY = 0
+            # 跳過第1頁（封面/基本資料摘要頁）
+            filter_data = uno.Any(
+                "[]com.sun.star.beans.PropertyValue",
+                (_mkprop("PageRange", "2-"),),
+            )
+            export_props = [
+                _mkprop("FilterName", "calc_pdf_Export"),
+                _mkprop("SelectionOnly", False),
+                _mkprop("FilterData", filter_data),
+            ]
+            doc.storeToURL("file://" + pdf_path, tuple(export_props))
+
+        return {
+            "premiums": premiums,
+            "tables": {"main": {"label": "保單年度明細", "rows": rows}},
+        }, pdf_path
+    finally:
+        doc.close(False)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+# ============================================================
+# SDG（醫保安心）/ SDH（金卡安心）/ SDJ（優卡安心）/ SDN（金卡順心）
+# 重大傷病／特定傷病終身健康保險 —— 四商品共用同一份範本家族結構，
+# 但「輸入頁」欄位位置、表頭列位置、終止年齡參照儲存格、以及「列印頁」
+# 是否含「滿期保險金」欄位皆略有差異，故用 SD_CONFIGS 依商品代碼分流。
+#
+# 結構重點：
+#   - 「列印頁」的年度明細表是單一連續表格，但跟 LTS 一樣，每印表頁會
+#     重複表頭列（見 SD_CONFIGS 的 header_row），所以沿用 LTS 的作法：
+#     用「保險年齡 -> 終止年齡」推算出預期列數 expected_years，逐列掃描、
+#     只收「is_data_cell 判定為真」的資料列，掃過表頭/子表頭/頁尾文字列
+#     不中斷，直到收滿 expected_years 列或超過安全上限為止。
+#   - 終止年齡的參照儲存格因商品而異：SDG/SDH/SDN 是 OP!C57（會動態依
+#     選定的繳費年期換算），SDJ 是 OP!F57（本商品固定只保至84歲，是
+#     寫死的常數，C57 在 SDJ 裡實際上是「剩餘年數」不是終止年齡，不可誤用）。
+#   - SDG 沒有「滿期保險金」欄位（列印頁只到解約金/減額繳清），
+#     SDH/SDJ/SDN 三者的列印頁在身故保障之後多一欄「滿期保險金」
+#     （對應 EXP 精算表），因此欄位對照要分兩種版本。
+#   - 「分期定期保險金給付」(指定比例/給付期間) 欄位只影響列印頁另一張
+#     不在本工具擷取範圍內的小表格，不影響身故保障／解約金等已擷取欄位，
+#     故不開放此進階選項輸入，維持範本預設值即可（比照 LTQT 略過雙被保
+#     險人欄位的原則：不使用的功能不需要特地串接）。
+#   - 被保險人身高/體重（僅 SDG 輸入頁才有的欄位）只用於同頁 BMI 顯示，
+#     未接到任何精算表查找，不影響試算結果，故也不需要當作輸入欄位。
+# ============================================================
+SD_COLUMN_MAP_NO_MATURITY = [
+    ("policy_year", "B"),
+    ("age", "C"),
+    ("annual_premium", "D"),
+    ("cum_premium", "F"),
+    ("death_benefit", "H"),                    # 身故/完全失能保障
+    ("critical_illness_mental", "J"),          # 重大傷病保險金-慢性精神病
+    ("critical_illness_other", "L"),           # 重大傷病保險金-除慢性精神病以外
+    ("specific_critical_illness", "N"),        # 特定重大傷病保險金(含除慢性精神病以外之重大傷病保險金)
+    ("specific_disease_benefit", "P"),         # 特定重大疾病保險金或特定傷病保險金
+    ("cash_value", "R"),                       # 年度末解約金
+    ("reduced_paid_up", "T"),                  # 年度末減額繳清保險金額
+]
+
+SD_COLUMN_MAP_WITH_MATURITY = [
+    ("policy_year", "B"),
+    ("age", "C"),
+    ("annual_premium", "D"),
+    ("cum_premium", "F"),
+    ("death_benefit", "H"),
+    ("critical_illness_mental", "J"),
+    ("critical_illness_other", "L"),
+    ("specific_critical_illness", "N"),
+    ("specific_disease_benefit", "P"),
+    ("maturity_benefit", "R"),                 # 滿期保險金
+    ("cash_value", "T"),
+    ("reduced_paid_up", "V"),
+]
+
+SD_CONFIGS = {
+    "SDG": {
+        "name_cell": "E4", "gender_cell": "K4", "birth_cell": "E6",
+        "relationship_cell": "E12", "payment_freq_cell": "E17",
+        "first_payment_cell": "Q17", "renewal_payment_cell": "Q19",
+        "discount_cell": "E19",
+        "payment_term_cell": "D38", "face_amount_cell": "J36",
+        "header_row": 22, "terminal_age_cell": "C57",
+        "column_map": SD_COLUMN_MAP_NO_MATURITY,
+    },
+    "SDH": {
+        "name_cell": "E5", "gender_cell": "K5", "birth_cell": "E7",
+        "relationship_cell": "E12", "payment_freq_cell": "E17",
+        "first_payment_cell": "Q17", "renewal_payment_cell": "Q19",
+        "discount_cell": "E20",
+        "payment_term_cell": "D33", "face_amount_cell": "J35",
+        "header_row": 22, "terminal_age_cell": "C57",
+        "column_map": SD_COLUMN_MAP_WITH_MATURITY,
+    },
+    "SDJ": {
+        "name_cell": "E5", "gender_cell": "K5", "birth_cell": "E7",
+        "relationship_cell": "E12", "payment_freq_cell": "E17",
+        "first_payment_cell": "Q17", "renewal_payment_cell": "Q19",
+        "discount_cell": "E20",
+        "payment_term_cell": "D33", "face_amount_cell": "J35",
+        "header_row": 21, "terminal_age_cell": "F57",
+        "column_map": SD_COLUMN_MAP_WITH_MATURITY,
+    },
+    "SDN": {
+        "name_cell": "E5", "gender_cell": "K5", "birth_cell": "E7",
+        "relationship_cell": "E12", "payment_freq_cell": "E17",
+        "first_payment_cell": "Q17", "renewal_payment_cell": "Q19",
+        "discount_cell": "E20",
+        "payment_term_cell": "D33", "face_amount_cell": "J35",
+        "header_row": 22, "terminal_age_cell": "C57",
+        "column_map": SD_COLUMN_MAP_WITH_MATURITY,
+    },
+}
+
+
+def calculate_sd(product_code: str, inputs: dict, want_pdf: bool = False):
+    """
+    inputs 需包含：
+      name (str)
+      gender（"男"/"女"）
+      birth_year / birth_month / birth_day（民國年/月/日）
+      relationship（預設 "同被保險人"）
+      payment_freq（預設 "年繳"，選項：年繳/半年繳/季繳/月繳）
+      first_payment_method / renewal_payment_method（預設 "金融機構轉帳"）
+      discount（預設 "無"）
+      payment_term（依商品而定：SDG/SDJ 僅 20；SDH/SDN 為 10/15/20/30）
+      face_amount_wan（保額，單位：萬元）
+    """
+    config = SD_CONFIGS.get(product_code.upper())
+    if not config:
+        raise CalcError(f"未支援的商品代碼: {product_code}")
+
+    template_name = PRODUCT_TEMPLATE.get(product_code.upper())
+    if not template_name:
+        raise CalcError(f"未支援的商品代碼: {product_code}")
+
+    src_path = os.path.join(TEMPLATE_DIR, template_name)
+    if not os.path.exists(src_path):
+        raise CalcError(f"找不到範本檔案: {template_name}")
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", dir="/tmp")
+    os.close(fd)
+    shutil.copyfile(src_path, tmp_path)
+
+    desktop = _connect()
+    url = "file://" + tmp_path
+    props = [_mkprop("Hidden", True)]
+    doc = desktop.loadComponentFromURL(url, "_blank", 0, tuple(props))
+
+    try:
+        sheets = doc.getSheets()
+        ip = sheets.getByName("輸入頁")
+        op = sheets.getByName("OP")
+
+        ip.getCellRangeByName(config["name_cell"]).setString(inputs.get("name", "客戶"))
+        ip.getCellRangeByName(config["gender_cell"]).setString(inputs.get("gender", "女"))
+        ip.getCellRangeByName(config["birth_cell"]).setValue(
+            _roc_birth_int(int(inputs["birth_year"]), int(inputs["birth_month"]), int(inputs["birth_day"]))
+        )
+        ip.getCellRangeByName(config["relationship_cell"]).setString(inputs.get("relationship", "同被保險人"))
+        ip.getCellRangeByName(config["payment_freq_cell"]).setString(inputs.get("payment_freq", "年繳"))
+        ip.getCellRangeByName(config["first_payment_cell"]).setString(inputs.get("first_payment_method", "金融機構轉帳"))
+        ip.getCellRangeByName(config["renewal_payment_cell"]).setString(inputs.get("renewal_payment_method", "金融機構轉帳"))
+        ip.getCellRangeByName(config["discount_cell"]).setString(inputs.get("discount", "無"))
+        ip.getCellRangeByName(config["payment_term_cell"]).setValue(int(inputs["payment_term"]))
+        ip.getCellRangeByName(config["face_amount_cell"]).setValue(float(inputs["face_amount_wan"]))
+
+        doc.calculateAll()
+
+        insurance_age = op.getCellRangeByName("D5").getValue()
+        terminal_age = op.getCellRangeByName(config["terminal_age_cell"]).getValue()
+
+        premiums = {
+            "first_period_premium": op.getCellRangeByName("C48").getValue(),
+            "renewal_period_premium": op.getCellRangeByName("C49").getValue(),
+            "first_year_premium": op.getCellRangeByName("C51").getValue(),
+            "renewal_year_premium": op.getCellRangeByName("C52").getValue(),
+            "final_face_amount_wan": op.getCellRangeByName("C28").getValue(),
+            "annual_premium_gross": op.getCellRangeByName("C35").getValue(),
+            "insurance_age": insurance_age,
+        }
+
+        print_sheet = sheets.getByName("列印頁")
+
+        def is_data_cell(cell):
+            # 同 CANCER/LTS：排除「型別顯示為 FORMULA、但實際算出的是文字
+            # （如頁尾免責聲明）」的儲存格，避免誤判成數值資料列。
+            s = cell.getString().strip()
+            if s == "" or cell.getType().value == "TEXT":
+                return False
+            try:
+                return float(s.replace(",", "")) == cell.getValue()
+            except ValueError:
+                return False
+
+        def cell_value_or_none(cell):
+            if _read_error(cell) != 0:
+                return None
+            return cell.getValue() if is_data_cell(cell) else None
+
+        rows = []
+        if insurance_age and insurance_age > 0 and terminal_age and terminal_age > 0:
+            expected_years = int(terminal_age - insurance_age + 1)
+            r = config["header_row"] + 2  # 跳過表頭列＋子表頭列，資料從此列開始
+            scanned = 0
+            # 安全上限：多留一倍緩衝，避免異常時無窮迴圈
+            while len(rows) < expected_years and scanned < 600:
+                first_cell = print_sheet.getCellRangeByName(f"B{r}")
+                if is_data_cell(first_cell):
+                    row = {}
+                    for field, col in config["column_map"]:
+                        c = print_sheet.getCellRangeByName(f"{col}{r}")
+                        row[field] = cell_value_or_none(c)
+                    rows.append(row)
+                r += 1
+                scanned += 1
+
+        pdf_path = None
+        if want_pdf:
+            fd2, pdf_path = tempfile.mkstemp(suffix=".pdf", dir="/tmp")
+            os.close(fd2)
+            controller = doc.getCurrentController()
+            controller.setActiveSheet(print_sheet)
             style_name = print_sheet.PageStyle
             page_style = doc.getStyleFamilies().getByName("PageStyles").getByName(style_name)
             page_style.ScaleToPagesX = 1
