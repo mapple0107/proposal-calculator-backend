@@ -18,6 +18,11 @@ TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "templates")
 PRODUCT_TEMPLATE = {
     "PFA3": "PFA.xlsx",
     "PFA6": "PFA.xlsx",
+    "PFJ6": "PFJ.xlsx",
+    "PFK1": "PFK.xlsx",
+    "PFK2": "PFK.xlsx",
+    "FPE1": "FPE.xlsx",
+    "FPE2": "FPE.xlsx",
     "CLZ": "CLZ.xlsx",
     "CLX": "CLX.xlsx",
     "LTS": "LTS.xlsx",
@@ -36,6 +41,11 @@ PRODUCT_TEMPLATE = {
 PRODUCT_FAMILY = {
     "PFA3": "PFA",
     "PFA6": "PFA",
+    "PFJ6": "PFA",
+    "PFK1": "PFA",
+    "PFK2": "PFA",
+    "FPE1": "PFA",
+    "FPE2": "PFA",
     "CLZ": "CANCER",
     "CLX": "CANCER",
     "LTS": "LTS",
@@ -162,6 +172,30 @@ def calculate(product_code: str, inputs: dict, want_pdf: bool = False):
     return calculate_pfa(product_code, inputs, want_pdf=want_pdf)
 
 
+# 保額型分紅商品：四份範本的「總表_分紅_H/M/L」欄位完全相同，共用 calculate_pfa，
+# 只有「輸入頁」格位依範本版面不同：
+#   版面 A（PFA、PFK）：生日 E8、檢核訊息 E9、建議書標示紅利等級 E23、
+#                       指定保險金分期比例 G28 以小數（0~1）輸入
+#   版面 B（PFJ、FPE）：生日 N5、檢核訊息 E6、沒有紅利等級選項、
+#                       指定保險金分期比例 G28 以百分比（0~100）輸入
+# 「依保費換算保額」的保費輸入格（OP!C61 參照的格子）各範本不同：PFA/PFK E55、PFJ E53、FPE E56。
+# 繳費年期：PFA3/PFA6/PFJ6 寫入 E37；PFK、FPE 的 E37 是公式（躉繳=1 年，其餘=2 年），
+# 不寫入，改由繳別決定——PFK1/FPE1 固定躉繳，PFK2/FPE2 由使用者選年繳/半年繳/季繳/月繳。
+PFA_LAYOUTS = {
+    "A": {"birth": "E8", "check": "E9", "scenario": "E23", "pct_scale": 0.01},
+    "B": {"birth": "N5", "check": "E6", "scenario": None, "pct_scale": 1},
+}
+PFA_PRODUCTS = {
+    "PFA3": {"layout": "A", "term": 3, "premium_cell": "E55"},
+    "PFA6": {"layout": "A", "term": 6, "premium_cell": "E55"},
+    "PFJ6": {"layout": "B", "term": 6, "premium_cell": "E53"},
+    "PFK1": {"layout": "A", "term": None, "fixed_freq": "躉繳", "premium_cell": "E55"},
+    "PFK2": {"layout": "A", "term": None, "premium_cell": "E55"},
+    "FPE1": {"layout": "B", "term": None, "fixed_freq": "躉繳", "premium_cell": "E56"},
+    "FPE2": {"layout": "B", "term": None, "premium_cell": "E56"},
+}
+
+
 def calculate_pfa(product_code: str, inputs: dict, want_pdf: bool = False):
     """
     inputs 需包含：
@@ -201,19 +235,27 @@ def calculate_pfa(product_code: str, inputs: dict, want_pdf: bool = False):
         ip = sheets.getByName("輸入頁")
         op = sheets.getByName("OP")
 
+        conf = PFA_PRODUCTS.get(product_code, {"layout": "A", "term": None, "premium_cell": "E55"})
+        lay = PFA_LAYOUTS[conf["layout"]]
+        freq = conf.get("fixed_freq") or inputs.get("payment_freq", "年繳")
+        if conf["term"] is None and not conf.get("fixed_freq") and freq == "躉繳":
+            raise CalcError("此商品為 2 年期，繳別請選年繳／半年繳／季繳／月繳")
+
         ip.getCellRangeByName("E5").setString(inputs.get("name", "客戶"))
         ip.getCellRangeByName("K5").setString(inputs["gender"])
-        ip.getCellRangeByName("E8").setValue(
+        ip.getCellRangeByName(lay["birth"]).setValue(
             _roc_birth_int(int(inputs["birth_year"]), int(inputs["birth_month"]), int(inputs["birth_day"]))
         )
-        ip.getCellRangeByName("E37").setValue(int(inputs["payment_term"]))
-        ip.getCellRangeByName("E17").setString(inputs.get("payment_freq", "年繳"))
-        ip.getCellRangeByName("E23").setString(inputs.get("dividend_scenario", "中分紅"))
+        if conf["term"] is not None:
+            ip.getCellRangeByName("E37").setValue(conf["term"])
+        ip.getCellRangeByName("E17").setString(freq)
+        if lay["scenario"]:
+            ip.getCellRangeByName(lay["scenario"]).setString(inputs.get("dividend_scenario", "中分紅"))
         ip.getCellRangeByName("E12").setString(inputs.get("relationship", "同被保險人"))
         ip.getCellRangeByName("E21").setString(inputs.get("discount", "無"))
 
-        death_pct = float(inputs.get("death_benefit_pct", 0) or 0) / 100.0
-        ip.getCellRangeByName("G28").setValue(death_pct)
+        death_pct = float(inputs.get("death_benefit_pct", 0) or 0)
+        ip.getCellRangeByName("G28").setValue(death_pct * lay["pct_scale"])
         if death_pct > 0:
             ip.getCellRangeByName("G32").setValue(int(inputs.get("installment_period", 20)))
 
@@ -221,13 +263,19 @@ def calculate_pfa(product_code: str, inputs: dict, want_pdf: bool = False):
         if input_mode == "premium":
             # 第一輪：用保費試算換算保額（OP!C62），再用換算後的保額做正式試算
             premium = float(inputs["premium_amount"])
-            ip.getCellRangeByName("E55").setValue(premium)
+            ip.getCellRangeByName(conf["premium_cell"]).setValue(premium)
             # 先給一個暫定保額讓公式鏈不報錯，再重算讀出換算值
             ip.getCellRangeByName("J39").setValue(30)
             doc.calculateAll()
             converted = op.getCellRangeByName("C62").getValue()
             if not converted or converted <= 0:
                 raise CalcError("保費換算保額失敗，請確認輸入的保費金額")
+            face_min = op.getCellRangeByName("C26").getValue()
+            face_max = op.getCellRangeByName("C27").getValue()
+            if not (face_min <= converted <= face_max):
+                raise CalcError(
+                    f"此保費換算保額約 {converted:g} 萬，超出本商品保額範圍 {face_min:g}～{face_max:g} 萬，請調整保費"
+                )
             ip.getCellRangeByName("J39").setValue(converted)
         else:
             face_amount = float(inputs["face_amount_wan"])
@@ -236,7 +284,7 @@ def calculate_pfa(product_code: str, inputs: dict, want_pdf: bool = False):
         doc.calculateAll()
 
         # 檢核錯誤
-        err_cell = ip.getCellRangeByName("E9")
+        err_cell = ip.getCellRangeByName(lay["check"])
         check_text = err_cell.getString()
 
         premiums = {
@@ -245,7 +293,23 @@ def calculate_pfa(product_code: str, inputs: dict, want_pdf: bool = False):
             "first_year_premium": op.getCellRangeByName("C51").getValue(),
             "renewal_year_premium": op.getCellRangeByName("C52").getValue(),
             "final_face_amount_wan": op.getCellRangeByName("C28").getValue(),
+            "annual_premium_gross": op.getCellRangeByName("C35").getValue(),
+            "payment_term": op.getCellRangeByName("C24").getValue(),
+            "payment_freq": freq,
         }
+        if premiums["annual_premium_gross"] <= 0:
+            age = op.getCellRangeByName("D5").getValue()
+            age_min = op.getCellRangeByName("C16").getValue()
+            age_max = op.getCellRangeByName("C15").getValue()
+            if not (age_min <= age <= age_max):
+                raise CalcError(f"投保年齡超出範圍：本商品限保險年齡 {age_min:g}～{age_max:g} 歲（目前 {age:g} 歲）")
+            face_min = op.getCellRangeByName("C26").getValue()
+            face_max = op.getCellRangeByName("C27").getValue()
+            face = op.getCellRangeByName("C28").getValue()
+            if not (face_min <= face <= face_max):
+                raise CalcError(f"保額超出範圍：此年齡限 {face_min:g}～{face_max:g} 萬（目前 {face:g} 萬）")
+            msg = check_text.strip()
+            raise CalcError(msg if msg else "輸入條件超出本商品承保範圍，請確認後再試")
 
         tables = {}
         for key, meta in RESULT_SHEETS.items():
@@ -259,7 +323,9 @@ def calculate_pfa(product_code: str, inputs: dict, want_pdf: bool = False):
                 row = {}
                 for field, col in COLUMN_MAP:
                     c = sheet.getCellRangeByName(f"{col}{r}")
-                    row[field] = c.getValue() if c.getString() != "" else None
+                    # 公式回傳 "" 時 LibreOffice 會顯示成空白（含格式空格），錯誤值（#N/A 等）
+                    # 的 getValue() 預設為 0，兩者都視為「無資料」回傳 None，前端顯示「—」。
+                    row[field] = c.getValue() if c.getString().strip() != "" and _read_error(c) == 0 else None
                 rows.append(row)
             tables[key] = {"label": meta["label"], "rows": rows}
 
