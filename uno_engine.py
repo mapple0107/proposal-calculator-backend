@@ -124,6 +124,28 @@ class CalcError(Exception):
     pass
 
 
+PAYMENT_FREQS = ["年繳", "半年繳", "季繳", "月繳"]
+
+
+def _premiums_by_freq(doc, ip, op, freq_cell, current_freq):
+    """依序把繳別切成年繳／半年繳／季繳／月繳各重算一次，回傳各繳別每期保費，
+    最後把繳別改回使用者選的值並重算，讓後續讀取的年度明細與 PDF 不受影響。
+    gross = 依該繳別換算的每期應繳保費（折扣前，OP!C35）；
+    first / renewal = 首期／續期每期實繳保費（折扣後，OP!C48 / C49）。"""
+    out = {}
+    for f in PAYMENT_FREQS:
+        ip.getCellRangeByName(freq_cell).setString(f)
+        doc.calculateAll()
+        out[f] = {
+            "gross": op.getCellRangeByName("C35").getValue(),
+            "first": op.getCellRangeByName("C48").getValue(),
+            "renewal": op.getCellRangeByName("C49").getValue(),
+        }
+    ip.getCellRangeByName(freq_cell).setString(current_freq)
+    doc.calculateAll()
+    return out
+
+
 def calculate(product_code: str, inputs: dict, want_pdf: bool = False):
     """依商品家族分派到對應的計算函式。"""
     family = PRODUCT_FAMILY.get(product_code.upper())
@@ -358,6 +380,9 @@ def calculate_cancer(product_code: str, inputs: dict, want_pdf: bool = False):
             # 「＿繳應繳保費/元」欄位，與已扣除折扣的 first_period_premium 不同。
             "annual_premium_gross": op.getCellRangeByName("C35").getValue(),
         }
+
+        if inputs.get("include_freq_table"):
+            premiums["by_freq"] = _premiums_by_freq(doc, ip, op, "E16", inputs.get("payment_freq", "年繳"))
 
         print_sheet = sheets.getByName("列印頁")
 
@@ -718,6 +743,9 @@ def _calculate_ltqt_layout(product_code: str, inputs: dict, want_pdf: bool, colu
             if not (face_min <= face <= face_max):
                 raise CalcError(f"保額超出範圍：限 {face_min:g}～{face_max:g} 萬元")
             raise CalcError("輸入內容超出本商品承保條件，無法試算，請確認各欄位")
+
+        if inputs.get("include_freq_table"):
+            premiums["by_freq"] = _premiums_by_freq(doc, ip, op, "E17", inputs.get("payment_freq", "年繳"))
 
         tov_sheet = sheets.getByName("總表")
 
