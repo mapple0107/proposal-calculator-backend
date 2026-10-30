@@ -28,6 +28,8 @@ PRODUCT_TEMPLATE = {
     "SDH": "SDH.xlsx",
     "SDJ": "SDJ.xlsx",
     "SDN": "SDN.xlsx",
+    "CIA": "CIA.xlsx",
+    "CIB": "CIB.xlsx",
 }
 
 # 商品家族：決定要用哪一套計算邏輯（輸入欄位對照、輸出表格結構都不同）
@@ -44,6 +46,8 @@ PRODUCT_FAMILY = {
     "SDH": "SD",
     "SDJ": "SD",
     "SDN": "SD",
+    "CIA": "CI",
+    "CIB": "CI",
 }
 
 # 注意：三個情境表格的代號雖是 H/M/L，但不是「紅利由高到低」的意思，
@@ -131,6 +135,8 @@ def calculate(product_code: str, inputs: dict, want_pdf: bool = False):
         return calculate_ltqt(product_code, inputs, want_pdf=want_pdf)
     if family == "SD":
         return calculate_sd(product_code, inputs, want_pdf=want_pdf)
+    if family == "CI":
+        return calculate_ci(product_code, inputs, want_pdf=want_pdf)
     return calculate_pfa(product_code, inputs, want_pdf=want_pdf)
 
 
@@ -615,7 +621,17 @@ LTQT_TABLE_ROW_END = 114  # 總表 named range TOV 上限 (總表!B3:AI114)
 
 
 def calculate_ltqt(product_code: str, inputs: dict, want_pdf: bool = False):
+    return _calculate_ltqt_layout(product_code, inputs, want_pdf, LTQT_COLUMN_MAP)
+
+
+def _calculate_ltqt_layout(product_code: str, inputs: dict, want_pdf: bool, column_map,
+                           fixed_gender=None, validate_range=False):
     """
+    LTQ/LTT/LTP 與 CIA/CIB 共用的試算流程（兩者「輸入頁」格位配置相同）。
+    column_map：要從「總表」擷取的欄位對照；fixed_gender：範本限定性別時傳入，
+    會忽略 inputs["gender"]；validate_range：超出承保範圍（範本會默默算出保費 0）
+    時改為回報明確錯誤。
+
     inputs 需包含：
       name (str)
       gender（"男"/"女"）
@@ -653,7 +669,7 @@ def calculate_ltqt(product_code: str, inputs: dict, want_pdf: bool = False):
         op = sheets.getByName("OP")
 
         ip.getCellRangeByName("E5").setString(inputs.get("name", "客戶"))
-        ip.getCellRangeByName("K5").setString(inputs.get("gender", "女"))
+        ip.getCellRangeByName("K5").setString(fixed_gender or inputs.get("gender", "女"))
         ip.getCellRangeByName("N5").setValue(
             _roc_birth_int(int(inputs["birth_year"]), int(inputs["birth_month"]), int(inputs["birth_day"]))
         )
@@ -685,6 +701,22 @@ def calculate_ltqt(product_code: str, inputs: dict, want_pdf: bool = False):
             "insurance_age": insurance_age,
         }
 
+        if validate_range and premiums["annual_premium_gross"] <= 0:
+            age_min = op.getCellRangeByName("C16").getValue()
+            age_max = op.getCellRangeByName("C15").getValue()
+            face_min = op.getCellRangeByName("C26").getValue()
+            face_max = op.getCellRangeByName("C27").getValue()
+            face = float(inputs["face_amount_wan"])
+            term = int(inputs["payment_term"])
+            if not (age_min <= insurance_age <= age_max):
+                raise CalcError(
+                    f"投保年齡超出範圍：繳費 {term} 年期限保險年齡 {age_min:g}～{age_max:g} 歲"
+                    f"（目前保險年齡 {insurance_age:g} 歲）"
+                )
+            if not (face_min <= face <= face_max):
+                raise CalcError(f"保額超出範圍：限 {face_min:g}～{face_max:g} 萬元")
+            raise CalcError("輸入內容超出本商品承保條件，無法試算，請確認各欄位")
+
         tov_sheet = sheets.getByName("總表")
 
         def is_data_cell(cell):
@@ -711,7 +743,7 @@ def calculate_ltqt(product_code: str, inputs: dict, want_pdf: bool = False):
             if not is_data_cell(first_cell):
                 break
             row = {}
-            for field, col in LTQT_COLUMN_MAP:
+            for field, col in column_map:
                 c = tov_sheet.getCellRangeByName(f"{col}{r}")
                 row[field] = cell_value_or_none(c)
             rows.append(row)
@@ -750,6 +782,35 @@ def calculate_ltqt(product_code: str, inputs: dict, want_pdf: bool = False):
             os.remove(tmp_path)
         except OSError:
             pass
+
+
+# ============================================================
+# CIA（豪愛守護防癌終身健康保險，限男性）/ CIB（真馨守護防癌終身健康保險，限女性）
+#
+# 「輸入頁」格位配置與 LTQ/LTT/LTP 完全相同（E5 姓名、K5 性別、N5 生日、
+# E17 繳別、E37 繳費年期 10/20/30、J39 保額…），因此共用 _calculate_ltqt_layout。
+# 性別由範本限定（En_Sex：CIA=OP!S3「男」、CIB=OP!S4「女」），不開放輸入。
+# 年度明細改擷取防癌險自己的欄位，對應「列印頁」投保利益表
+# （列印頁 VLOOKUP TOV 的欄序：2/26/27/28/29/30/7 → 總表 C/AA/AB/AC/AD/AE/H）。
+# 本商品無解約金、不分紅。
+# ============================================================
+CI_FIXED_GENDER = {"CIA": "男", "CIB": "女"}
+CI_COLUMN_MAP = [
+    ("policy_year", "B"),       # 保單年度
+    ("age", "C"),               # 保險年齡
+    ("annual_premium", "AA"),   # 年度實繳保費
+    ("cum_premium", "AB"),      # 累計實繳保費
+    ("cancer_early", "AC"),     # 首次罹患癌症(初期)或癌症(輕度)保險金
+    ("cancer_severe", "AD"),    # 首次罹患癌症(重度)保險金
+    ("cancer_specific", "AE"),  # 首次罹患特定癌症(重度)保險金
+    ("death_benefit", "H"),     # 年度末身故保障
+]
+
+
+def calculate_ci(product_code: str, inputs: dict, want_pdf: bool = False):
+    code = product_code.upper()
+    return _calculate_ltqt_layout(code, inputs, want_pdf, CI_COLUMN_MAP,
+                                  fixed_gender=CI_FIXED_GENDER[code], validate_range=True)
 
 
 # ============================================================

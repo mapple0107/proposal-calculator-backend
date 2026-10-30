@@ -24,7 +24,7 @@ def calculate(product_code):
     data = request.get_json(force=True, silent=True) or {}
 
     family = uno_engine.PRODUCT_FAMILY.get(product_code)
-    if family == "CANCER":
+    if family in ("CANCER", "CI"):
         required = ["birth_year", "birth_month", "birth_day", "payment_term", "face_amount_wan"]
     elif family in ("LTS", "LTQT", "SD"):
         required = ["gender", "birth_year", "birth_month", "birth_day", "payment_term", "face_amount_wan"]
