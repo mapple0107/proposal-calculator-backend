@@ -374,7 +374,8 @@ def calculate_cancer(product_code: str, inputs: dict, want_pdf: bool = False):
             if s == "" or cell.getType().value == "TEXT":
                 return False
             try:
-                return float(s.replace(",", "")) == cell.getValue()
+                # 容許顯示四捨五入與浮點誤差（如 109390.00000000001 顯示為 109,390）
+                return abs(float(s.replace(",", "")) - cell.getValue()) < 1
             except ValueError:
                 return False
 
@@ -526,7 +527,8 @@ def calculate_lts(product_code: str, inputs: dict, want_pdf: bool = False):
             if s == "" or cell.getType().value == "TEXT":
                 return False
             try:
-                return float(s.replace(",", "")) == cell.getValue()
+                # 容許顯示四捨五入與浮點誤差（如 109390.00000000001 顯示為 109,390）
+                return abs(float(s.replace(",", "")) - cell.getValue()) < 1
             except ValueError:
                 return False
 
@@ -726,7 +728,8 @@ def _calculate_ltqt_layout(product_code: str, inputs: dict, want_pdf: bool, colu
             if s == "" or cell.getType().value == "TEXT":
                 return False
             try:
-                return float(s.replace(",", "")) == cell.getValue()
+                # 容許顯示四捨五入與浮點誤差（如 109390.00000000001 顯示為 109,390）
+                return abs(float(s.replace(",", "")) - cell.getValue()) < 1
             except ValueError:
                 return False
 
@@ -983,7 +986,8 @@ def calculate_sd(product_code: str, inputs: dict, want_pdf: bool = False):
             if s == "" or cell.getType().value == "TEXT":
                 return False
             try:
-                return float(s.replace(",", "")) == cell.getValue()
+                # 容許顯示四捨五入與浮點誤差（如 109390.00000000001 顯示為 109,390）
+                return abs(float(s.replace(",", "")) - cell.getValue()) < 1
             except ValueError:
                 return False
 
