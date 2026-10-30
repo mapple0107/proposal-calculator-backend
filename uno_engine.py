@@ -87,6 +87,8 @@ COLUMN_MAP = [
     ("annual_dividend", "K"),   # 年度末 年度保單紅利
     ("paid_up_amount", "M"),    # 年度末 繳清保險金額
     ("total_amount", "N"),      # 年度末 保險金額
+    ("total_death_benefit", "W"),  # 年度末身故/完全失能時可領總金額（含紅利增加保額）
+    ("total_cash_value", "X"),     # 年度末解約時可領總金額（含紅利增加保額之解約金）
 ]
 
 DATA_ROW_START = 5
@@ -156,8 +158,25 @@ def _premiums_by_freq(doc, ip, op, freq_cell, current_freq):
     return out
 
 
+# LibreOffice（單一 soffice 程序）不能同時處理兩份文件的載入／重算：
+# gunicorn 2 個 worker 同時送試算時，soffice 會卡死且不會自行恢復，之後所有試算都失敗。
+# 這裡用跨程序的檔案鎖讓所有試算依序使用 LibreOffice（同一時間只有一筆），
+# 其他請求排隊等待；單筆試算約 1～10 秒，排隊時間遠小於 gunicorn timeout。
+_UNO_LOCK_PATH = os.environ.get("UNO_LOCK_PATH", "/tmp/uno_engine.lock")
+
+
 def calculate(product_code: str, inputs: dict, want_pdf: bool = False):
-    """依商品家族分派到對應的計算函式。"""
+    """依商品家族分派到對應的計算函式（全程持有 LibreOffice 鎖）。"""
+    import fcntl
+    with open(_UNO_LOCK_PATH, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            return _calculate_unlocked(product_code, inputs, want_pdf)
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _calculate_unlocked(product_code: str, inputs: dict, want_pdf: bool = False):
     family = PRODUCT_FAMILY.get(product_code.upper())
     if family == "CANCER":
         return calculate_cancer(product_code, inputs, want_pdf=want_pdf)

@@ -26,4 +26,5 @@ else:
 PYEOF
 
 echo "啟動 API 服務..."
-exec gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 2 --timeout 120 app:app
+# 試算會在 uno_engine 內依序排隊使用 LibreOffice，timeout 放寬以容納排隊時間
+exec gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 2 --timeout 300 app:app
