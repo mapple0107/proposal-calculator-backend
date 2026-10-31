@@ -23,6 +23,10 @@ PRODUCT_TEMPLATE = {
     "PFK2": "PFK.xlsx",
     "FPE1": "FPE.xlsx",
     "FPE2": "FPE.xlsx",
+    "FBM": "FBM.xlsx",
+    "FBO": "FBO.xlsx",
+    "FBX": "FBX.xlsx",
+    "FBV": "FBV.xlsx",
     "CLZ": "CLZ.xlsx",
     "CLX": "CLX.xlsx",
     "LTS": "LTS.xlsx",
@@ -46,6 +50,10 @@ PRODUCT_FAMILY = {
     "PFK2": "PFA",
     "FPE1": "PFA",
     "FPE2": "PFA",
+    "FBM": "UL",
+    "FBO": "UL",
+    "FBX": "UL",
+    "FBV": "UL",
     "CLZ": "CANCER",
     "CLX": "CANCER",
     "LTS": "LTS",
@@ -188,6 +196,8 @@ def _calculate_unlocked(product_code: str, inputs: dict, want_pdf: bool = False)
         return calculate_sd(product_code, inputs, want_pdf=want_pdf)
     if family == "CI":
         return calculate_ci(product_code, inputs, want_pdf=want_pdf)
+    if family == "UL":
+        return calculate_ul(product_code, inputs, want_pdf=want_pdf)
     return calculate_pfa(product_code, inputs, want_pdf=want_pdf)
 
 
@@ -1152,6 +1162,198 @@ def calculate_sd(product_code: str, inputs: dict, want_pdf: bool = False):
             "premiums": premiums,
             "tables": {"main": {"label": "保單年度明細", "rows": rows}},
         }, pdf_path
+    finally:
+        doc.close(False)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+# ============================================================
+# 利變型保單（外幣利率變動型終身壽險）：FBM / FBO / FBX / FBV
+#
+# 與保額型分紅不同處：
+#   - 沒有三種分紅情境，改為兩個宣告利率情境：
+#       「總表」  = 目前宣告利率（範本內建，如 4.35%；FBM 為 4.15%）
+#       「總表_1」= 宣告利率降低 1%（FBM 範本無此表）
+#     宣告利率數值直接讀 計算!G3 / 計算_1!G3 作為情境標題。
+#   - 年度明細欄位（總表）：D 年度實繳保費、E 累計實繳保費、H 保證身故、I 保證解約金、
+#     K 增值回饋分享金(預估)、N 年度末保險金額(預估)、U 身故時可領總金額、V 解約時可領總金額。
+#   - 輸入格（輸入頁）：FBM/FBO/FBX 生日 E8、檢核 E9、分期比例 G28 以小數輸入；
+#     FBV 生日 N5、檢核 E6、G28 以百分比輸入。保費換算保額的保費輸入格為 OP!C61 所參照的格子
+#     （FBM/FBO E53、FBX E55、FBV E60）。
+#   - 繳費年期：FBM（6/10/20）、FBO（2/6/8）由 E37 輸入；FBX 的 E37 為公式（躉繳=1、其餘=2），
+#     由繳別決定；FBV 只有躉繳。
+# ============================================================
+UL_PRODUCTS = {
+    "FBM": {"template": "FBM.xlsx", "birth": "E8", "check": "E9", "premium_cell": "E53",
+            "pct_scale": 0.01, "terms": [6, 10, 20], "start_row": 4},
+    "FBO": {"template": "FBO.xlsx", "birth": "E8", "check": "E9", "premium_cell": "E53",
+            "pct_scale": 0.01, "terms": [2, 6, 8], "start_row": 4},
+    "FBX": {"template": "FBX.xlsx", "birth": "E8", "check": "E9", "premium_cell": "E55",
+            "pct_scale": 0.01, "terms": None, "start_row": 4},
+    "FBV": {"template": "FBV.xlsx", "birth": "N5", "check": "E6", "premium_cell": "E60",
+            "pct_scale": 1, "terms": None, "fixed_freq": "躉繳", "start_row": 6},
+}
+UL_SCENARIOS = [("declared", "總表", "計算"), ("declared_low", "總表_1", "計算_1")]
+UL_COLUMN_MAP = [
+    ("policy_year", "B"),
+    ("age", "C"),
+    ("annual_premium", "D"),        # 年度實繳保費
+    ("cum_premium", "E"),           # 累計實繳保費
+    ("death_benefit", "H"),         # 年度末身故/完全失能保障（保證）
+    ("cash_value", "I"),            # 年度末解約金（保證）
+    ("annual_dividend", "K"),       # 年度末增值回饋分享金（預估）
+    ("total_amount", "N"),          # 年度末保險金額（預估，含增額繳清）
+    ("total_death_benefit", "U"),   # 年度末身故時可領總金額（預估）
+    ("total_cash_value", "V"),      # 年度末解約時可領總金額（預估）
+]
+
+
+def _rate_label(cell):
+    s = cell.getString().strip()
+    if s.endswith("%"):
+        return s
+    v = cell.getValue()
+    return f"{v * 100:.2f}%" if v else s
+
+
+def calculate_ul(product_code: str, inputs: dict, want_pdf: bool = False):
+    code = product_code.upper()
+    conf = UL_PRODUCTS.get(code)
+    if not conf:
+        raise CalcError(f"未支援的商品代碼: {product_code}")
+    src_path = os.path.join(TEMPLATE_DIR, conf["template"])
+    if not os.path.exists(src_path):
+        raise CalcError(f"找不到範本檔案: {conf['template']}")
+
+    freq = conf.get("fixed_freq") or inputs.get("payment_freq", "年繳")
+    if conf["terms"]:
+        term = int(inputs.get("payment_term") or conf["terms"][0])
+        if term not in conf["terms"]:
+            raise CalcError(f"繳費年期限 {'/'.join(map(str, conf['terms']))} 年")
+        if freq == "躉繳":
+            raise CalcError("此商品為分期繳費，繳別請選年繳／半年繳／季繳／月繳")
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", dir="/tmp")
+    os.close(fd)
+    shutil.copyfile(src_path, tmp_path)
+
+    desktop = _connect()
+    doc = desktop.loadComponentFromURL("file://" + tmp_path, "_blank", 0, (_mkprop("Hidden", True),))
+    try:
+        sheets = doc.getSheets()
+        ip = sheets.getByName("輸入頁")
+        op = sheets.getByName("OP")
+
+        ip.getCellRangeByName("E5").setString(inputs.get("name", "客戶"))
+        ip.getCellRangeByName("K5").setString(inputs["gender"])
+        ip.getCellRangeByName(conf["birth"]).setValue(
+            _roc_birth_int(int(inputs["birth_year"]), int(inputs["birth_month"]), int(inputs["birth_day"]))
+        )
+        if conf["terms"]:
+            ip.getCellRangeByName("E37").setValue(term)
+        ip.getCellRangeByName("E17").setString(freq)
+        ip.getCellRangeByName("E12").setString(inputs.get("relationship", "同被保險人"))
+        ip.getCellRangeByName("E21").setString(inputs.get("discount", "無"))
+        if inputs.get("bonus_method"):
+            ip.getCellRangeByName("E19").setString(inputs["bonus_method"])
+
+        death_pct = float(inputs.get("death_benefit_pct", 0) or 0)
+        ip.getCellRangeByName("G28").setValue(death_pct * conf["pct_scale"])
+        if death_pct > 0:
+            ip.getCellRangeByName("G32").setValue(int(inputs.get("installment_period", 20)))
+
+        if inputs.get("input_mode") == "premium":
+            ip.getCellRangeByName(conf["premium_cell"]).setValue(float(inputs["premium_amount"]))
+            ip.getCellRangeByName("J39").setValue(10)
+            doc.calculateAll()
+            converted = op.getCellRangeByName("C62").getValue()
+            if not converted or converted <= 0:
+                raise CalcError("保費換算保額失敗，請確認輸入的保費金額")
+            face_min = op.getCellRangeByName("C26").getValue()
+            face_max = op.getCellRangeByName("C27").getValue()
+            if not (face_min <= converted <= face_max):
+                raise CalcError(
+                    f"此保費換算保額約 {converted:g} 萬，超出本商品保額範圍 {face_min:g}～{face_max:g} 萬，請調整保費"
+                )
+            ip.getCellRangeByName("J39").setValue(converted)
+        else:
+            ip.getCellRangeByName("J39").setValue(float(inputs["face_amount_wan"]))
+
+        doc.calculateAll()
+        check_text = ip.getCellRangeByName(conf["check"]).getString()
+
+        premiums = {
+            "first_period_premium": op.getCellRangeByName("C48").getValue(),
+            "renewal_period_premium": op.getCellRangeByName("C49").getValue(),
+            "first_year_premium": op.getCellRangeByName("C51").getValue(),
+            "renewal_year_premium": op.getCellRangeByName("C52").getValue(),
+            "final_face_amount_wan": op.getCellRangeByName("C28").getValue(),
+            "annual_premium_gross": op.getCellRangeByName("C35").getValue(),
+            "payment_term": op.getCellRangeByName("C24").getValue(),
+            "payment_freq": freq,
+        }
+        if premiums["annual_premium_gross"] <= 0:
+            age = op.getCellRangeByName("D5").getValue()
+            age_min = op.getCellRangeByName("C16").getValue()
+            age_max = op.getCellRangeByName("C15").getValue()
+            if not (age_min <= age <= age_max):
+                raise CalcError(f"投保年齡超出範圍：此繳費年期限保險年齡 {age_min:g}～{age_max:g} 歲（目前 {age:g} 歲）")
+            face_min = op.getCellRangeByName("C26").getValue()
+            face_max = op.getCellRangeByName("C27").getValue()
+            face = op.getCellRangeByName("C28").getValue()
+            if not (face_min <= face <= face_max):
+                raise CalcError(f"保額超出範圍：此年齡限 {face_min:g}～{face_max:g} 萬（目前 {face:g} 萬）")
+            msg = check_text.strip()
+            raise CalcError(msg if msg else "輸入條件超出本商品承保範圍，請確認後再試")
+
+        def num(cell):
+            s = cell.getString().strip()
+            if s == "" or _read_error(cell) != 0:
+                return None
+            try:
+                float(s.replace(",", "").replace("%", ""))
+            except ValueError:
+                return None
+            return cell.getValue()
+
+        tables = {}
+        names = [sheets.getByIndex(i).getName() for i in range(sheets.getCount())]
+        for key, sheet_name, calc_name in UL_SCENARIOS:
+            if sheet_name not in names:
+                continue
+            sh = sheets.getByName(sheet_name)
+            rows = []
+            r = conf["start_row"]
+            while r < conf["start_row"] + 130:
+                if num(sh.getCellRangeByName(f"B{r}")) is None:
+                    break
+                rows.append({f: num(sh.getCellRangeByName(f"{c}{r}")) for f, c in UL_COLUMN_MAP})
+                r += 1
+            rate = _rate_label(sheets.getByName(calc_name).getCellRangeByName("G3")) if calc_name in names else ""
+            label = f"宣告利率 {rate}" + ("（降低 1%）" if key == "declared_low" else "（目前）")
+            tables[key] = {"label": label, "rate": rate, "rows": rows}
+
+        pdf_path = None
+        if want_pdf:
+            fd2, pdf_path = tempfile.mkstemp(suffix=".pdf", dir="/tmp")
+            os.close(fd2)
+            print_sheet = sheets.getByName("列印頁")
+            doc.getCurrentController().setActiveSheet(print_sheet)
+            # 部分範本（如 FBX）欄寬超出單頁，縮放至頁寬 1 頁、高度不限，避免表格被切到其他頁
+            page_style = doc.getStyleFamilies().getByName("PageStyles").getByName(print_sheet.PageStyle)
+            page_style.ScaleToPagesX = 1
+            page_style.ScaleToPagesY = 0
+            filter_data = uno.Any("[]com.sun.star.beans.PropertyValue", (_mkprop("PageRange", "2-"),))
+            doc.storeToURL("file://" + pdf_path, (
+                _mkprop("FilterName", "calc_pdf_Export"),
+                _mkprop("SelectionOnly", False),
+                _mkprop("FilterData", filter_data),
+            ))
+
+        return {"check_message": check_text, "premiums": premiums, "tables": tables}, pdf_path
     finally:
         doc.close(False)
         try:
