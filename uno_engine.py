@@ -1174,10 +1174,9 @@ def calculate_sd(product_code: str, inputs: dict, want_pdf: bool = False):
 # 利變型保單（外幣利率變動型終身壽險）：FBM / FBO / FBX / FBV
 #
 # 與保額型分紅不同處：
-#   - 沒有三種分紅情境，改為兩個宣告利率情境：
-#       「總表」  = 目前宣告利率（範本內建，如 4.35%；FBM 為 4.15%）
-#       「總表_1」= 宣告利率降低 1%（FBM 範本無此表）
-#     宣告利率數值直接讀 計算!G3 / 計算_1!G3 作為情境標題。
+#   - 沒有三種分紅情境，只依「目前宣告利率」試算（總表；範本內建，如 4.35%，FBM 為 4.15%），
+#     與正式建議書（列印頁）一致。範本另有「總表_1」（宣告利率 −1%），只供華銀試算參考頁使用，
+#     不屬於正式建議書內容，故不回傳。宣告利率數值讀 計算!G3 作為標題。
 #   - 年度明細欄位（總表）：D 年度實繳保費、E 累計實繳保費、H 保證身故、I 保證解約金、
 #     K 增值回饋分享金(預估)、N 年度末保險金額(預估)、U 身故時可領總金額、V 解約時可領總金額。
 #   - 輸入格（輸入頁）：FBM/FBO/FBX 生日 E8、檢核 E9、分期比例 G28 以小數輸入；
@@ -1196,7 +1195,7 @@ UL_PRODUCTS = {
     "FBV": {"template": "FBV.xlsx", "birth": "N5", "check": "E6", "premium_cell": "E60",
             "pct_scale": 1, "terms": None, "fixed_freq": "躉繳", "start_row": 6},
 }
-UL_SCENARIOS = [("declared", "總表", "計算"), ("declared_low", "總表_1", "計算_1")]
+UL_SCENARIOS = [("declared", "總表", "計算")]
 UL_COLUMN_MAP = [
     ("policy_year", "B"),
     ("age", "C"),
@@ -1333,7 +1332,7 @@ def calculate_ul(product_code: str, inputs: dict, want_pdf: bool = False):
                 rows.append({f: num(sh.getCellRangeByName(f"{c}{r}")) for f, c in UL_COLUMN_MAP})
                 r += 1
             rate = _rate_label(sheets.getByName(calc_name).getCellRangeByName("G3")) if calc_name in names else ""
-            label = f"宣告利率 {rate}" + ("（降低 1%）" if key == "declared_low" else "（目前）")
+            label = f"宣告利率 {rate}"
             tables[key] = {"label": label, "rate": rate, "rows": rows}
 
         pdf_path = None
