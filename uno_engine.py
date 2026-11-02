@@ -19,6 +19,7 @@ PRODUCT_TEMPLATE = {
     "PFA3": "PFA.xlsx",
     "PFA6": "PFA.xlsx",
     "PFJ6": "PFJ.xlsx",
+    "PFD": "PFD.xlsx",
     "PFK1": "PFK.xlsx",
     "PFK2": "PFK.xlsx",
     "FPE1": "FPE.xlsx",
@@ -46,6 +47,7 @@ PRODUCT_FAMILY = {
     "PFA3": "PFA",
     "PFA6": "PFA",
     "PFJ6": "PFA",
+    "PFD": "PFA",
     "PFK1": "PFA",
     "PFK2": "PFA",
     "FPE1": "PFA",
@@ -218,6 +220,8 @@ PFA_PRODUCTS = {
     "PFA3": {"layout": "A", "term": 3, "premium_cell": "E55"},
     "PFA6": {"layout": "A", "term": 6, "premium_cell": "E55"},
     "PFJ6": {"layout": "B", "term": 6, "premium_cell": "E53"},
+    # PFD 紅富美好：繳費年期 10／20 年由使用者選，寫入 E37
+    "PFD": {"layout": "A", "term": None, "terms": [10, 20], "premium_cell": "E53"},
     "PFK1": {"layout": "A", "term": None, "fixed_freq": "躉繳", "premium_cell": "E55"},
     "PFK2": {"layout": "A", "term": None, "premium_cell": "E55"},
     "FPE1": {"layout": "B", "term": None, "fixed_freq": "躉繳", "premium_cell": "E56"},
@@ -267,16 +271,23 @@ def calculate_pfa(product_code: str, inputs: dict, want_pdf: bool = False):
         conf = PFA_PRODUCTS.get(product_code, {"layout": "A", "term": None, "premium_cell": "E55"})
         lay = PFA_LAYOUTS[conf["layout"]]
         freq = conf.get("fixed_freq") or inputs.get("payment_freq", "年繳")
-        if conf["term"] is None and not conf.get("fixed_freq") and freq == "躉繳":
+        term = conf["term"]
+        if conf.get("terms"):
+            term = int(inputs.get("payment_term") or conf["terms"][0])
+            if term not in conf["terms"]:
+                raise CalcError(f"繳費年期限 {'/'.join(map(str, conf['terms']))} 年")
+        if term is None and not conf.get("fixed_freq") and freq == "躉繳":
             raise CalcError("此商品為 2 年期，繳別請選年繳／半年繳／季繳／月繳")
+        if conf.get("terms") and freq == "躉繳":
+            raise CalcError("此商品為分期繳費，繳別請選年繳／半年繳／季繳／月繳")
 
         ip.getCellRangeByName("E5").setString(inputs.get("name", "客戶"))
         ip.getCellRangeByName("K5").setString(inputs["gender"])
         ip.getCellRangeByName(lay["birth"]).setValue(
             _roc_birth_int(int(inputs["birth_year"]), int(inputs["birth_month"]), int(inputs["birth_day"]))
         )
-        if conf["term"] is not None:
-            ip.getCellRangeByName("E37").setValue(conf["term"])
+        if term is not None:
+            ip.getCellRangeByName("E37").setValue(term)
         ip.getCellRangeByName("E17").setString(freq)
         if lay["scenario"]:
             ip.getCellRangeByName(lay["scenario"]).setString(inputs.get("dividend_scenario", "中分紅"))
