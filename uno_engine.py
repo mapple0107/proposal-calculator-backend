@@ -20,6 +20,9 @@ PRODUCT_TEMPLATE = {
     "PFA6": "PFA.xlsx",
     "PFJ6": "PFJ.xlsx",
     "PFD": "PFD.xlsx",
+    "PFW": "PFW.xlsx",
+    "PFN": "PFN.xlsx",
+    "PF5": "PF5.xlsx",
     "PFK1": "PFK.xlsx",
     "PFK2": "PFK.xlsx",
     "FPE1": "FPE.xlsx",
@@ -48,6 +51,9 @@ PRODUCT_FAMILY = {
     "PFA6": "PFA",
     "PFJ6": "PFA",
     "PFD": "PFA",
+    "PFW": "PFA",
+    "PFN": "PFA",
+    "PF5": "PFA",
     "PFK1": "PFA",
     "PFK2": "PFA",
     "FPE1": "PFA",
@@ -99,6 +105,8 @@ COLUMN_MAP = [
     ("total_amount", "N"),      # 年度末 保險金額
     ("total_death_benefit", "W"),  # 年度末身故/完全失能時可領總金額（含紅利增加保額）
     ("total_cash_value", "X"),     # 年度末解約時可領總金額（含紅利增加保額之解約金）
+    ("survival_total", "S"),       # 當年度可領生存保險金（含紅利增加保額部分，F+O）
+    ("cum_survival_total", "T"),   # 累計已領生存保險金（含紅利增加保額部分）
 ]
 
 DATA_ROW_START = 5
@@ -222,6 +230,13 @@ PFA_PRODUCTS = {
     "PFJ6": {"layout": "B", "term": 6, "premium_cell": "E53"},
     # PFD 紅富美好：繳費年期 10／20 年由使用者選，寫入 E37
     "PFD": {"layout": "A", "term": None, "terms": [10, 20], "premium_cell": "E53"},
+    # 退休規劃（分紅終身保險，約定年齡起每年領生存保險金）：險種代號 E39 決定開始領取年齡
+    "PFW": {"layout": "A", "term": 6, "premium_cell": "E53",
+            "plans": {50: "PFWA", 55: "PFWB", 60: "PFWC", 65: "PFWD", 70: "PFWE", 75: "PFWF"}},
+    "PFN": {"layout": "A", "term": None, "terms": [10, 20], "premium_cell": "E53",
+            "plans": {55: "55@PFNA", 60: "60@PFNB", 65: "65@PFNC"}},
+    "PF5": {"layout": "A", "term": None, "terms": [3, 6], "premium_cell": "E53",
+            "plans": {55: "PF55", 60: "PF60", 65: "PF65"}},
     "PFK1": {"layout": "A", "term": None, "fixed_freq": "躉繳", "premium_cell": "E55"},
     "PFK2": {"layout": "A", "term": None, "premium_cell": "E55"},
     "FPE1": {"layout": "B", "term": None, "fixed_freq": "躉繳", "premium_cell": "E56"},
@@ -288,6 +303,12 @@ def calculate_pfa(product_code: str, inputs: dict, want_pdf: bool = False):
         )
         if term is not None:
             ip.getCellRangeByName("E37").setValue(term)
+        if conf.get("plans"):
+            ages = sorted(conf["plans"])
+            retire_age = int(inputs.get("retire_age") or ages[0])
+            if retire_age not in conf["plans"]:
+                raise CalcError(f"開始領取年齡限 {'／'.join(map(str, ages))} 歲")
+            ip.getCellRangeByName("E39").setString(conf["plans"][retire_age])
         ip.getCellRangeByName("E17").setString(freq)
         if lay["scenario"]:
             ip.getCellRangeByName(lay["scenario"]).setString(inputs.get("dividend_scenario", "中分紅"))
