@@ -20,6 +20,7 @@ PRODUCT_TEMPLATE = {
     "PFA6": "PFA.xlsx",
     "PFJ6": "PFJ.xlsx",
     "PFD": "PFD.xlsx",
+    "FPG": "FPG.xlsx",
     "PFW": "PFW.xlsx",
     "PFN": "PFN.xlsx",
     "PF5": "PF5.xlsx",
@@ -53,6 +54,7 @@ PRODUCT_FAMILY = {
     "PFA6": "PFA",
     "PFJ6": "PFA",
     "PFD": "PFA",
+    "FPG": "PFA",
     "PFW": "PFA",
     "PFN": "PFA",
     "PF5": "PFA",
@@ -234,6 +236,8 @@ PFA_PRODUCTS = {
     "PFJ6": {"layout": "B", "term": 6, "premium_cell": "E53"},
     # PFD 紅富美好：繳費年期 10／20 年由使用者選，寫入 E37
     "PFD": {"layout": "A", "term": None, "terms": [10, 20], "premium_cell": "E53"},
+    # FPG 紅運心傳：繳費年期 3／5 年，版型同 PFJ（生日 N5、無分紅情境選項），保費換算保額輸入 E56
+    "FPG": {"layout": "B", "term": None, "terms": [3, 5], "premium_cell": "E56"},
     # 退休規劃（分紅終身保險，約定年齡起每年領生存保險金）：險種代號 E39 決定開始領取年齡
     "PFW": {"layout": "A", "term": 6, "premium_cell": "E53",
             "plans": {50: "PFWA", 55: "PFWB", 60: "PFWC", 65: "PFWD", 70: "PFWE", 75: "PFWF"}},
