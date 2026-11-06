@@ -2,6 +2,7 @@
 LibreOffice UNO 重算引擎
 負責：開啟商品範本 xlsx -> 寫入客戶輸入 -> calculateAll() -> 讀出結果表 -> (可選)匯出 PDF
 """
+import math
 import os
 import shutil
 import tempfile
@@ -257,6 +258,57 @@ PFA_PRODUCTS = {
 }
 
 
+def _solve_face_for_net_premium(doc, ip, op, inputs, start_face):
+    """以「折扣後」實繳保費反推保額。
+
+    官方試算表的保費換算保額（OP!C62）是用折扣前保費計算；這裡改以折扣後的實繳保費為目標：
+    找出實繳保費不超過目標金額的最大保額（保額最小單位依 OP!E28 小數位數）。
+      inputs["premium_target"] = "annual"（首年實繳保費）或 "total"（總繳實繳保費）
+      目標金額：annual 用 premium_amount，total 用 premium_total_amount（美元）
+    """
+    kind = inputs.get("premium_target", "annual")
+    target = float(inputs["premium_total_amount"] if kind == "total" else inputs["premium_amount"])
+    digits = int(op.getCellRangeByName("E28").getValue() or 0)
+    step = 10 ** -digits
+    face_min = op.getCellRangeByName("C26").getValue()
+    face_max = op.getCellRangeByName("C27").getValue()
+    cache = {}
+
+    def paid(face):
+        face = round(face, digits)
+        if face not in cache:
+            ip.getCellRangeByName("J39").setValue(face)
+            doc.calculateAll()
+            first = op.getCellRangeByName("C51").getValue()
+            renew = op.getCellRangeByName("C52").getValue()
+            term = int(op.getCellRangeByName("C24").getValue() or 1)
+            cache[face] = first + renew * (term - 1) if kind == "total" else first
+        return cache[face]
+
+    def floor(x):
+        return math.floor(x / step + 1e-9) * step
+
+    face = max(face_min, min(face_max, floor(start_face)))
+    for _ in range(6):                      # 依比例逼近
+        v = paid(face)
+        if v <= 0:
+            break
+        nxt = max(face_min, min(face_max, floor(face * target / v)))
+        if abs(nxt - face) < step / 2:
+            break
+        face = nxt
+    while paid(face) > target and face - step >= face_min - 1e-9:   # 超過目標就往下調
+        face = round(face - step, digits)
+    for _ in range(20):                     # 還有空間就往上加
+        up = round(face + step, digits)
+        if up > face_max + 1e-9 or paid(up) > target:
+            break
+        face = up
+    if paid(face) > target:
+        raise CalcError(f"此保費低於本商品最低保額 {face_min:g} 萬的保費，請提高保費")
+    return round(face, digits)
+
+
 def calculate_pfa(product_code: str, inputs: dict, want_pdf: bool = False):
     """
     inputs 需包含：
@@ -350,6 +402,8 @@ def calculate_pfa(product_code: str, inputs: dict, want_pdf: bool = False):
                 raise CalcError(
                     f"此保費換算保額約 {converted:g} 萬，超出本商品保額範圍 {face_min:g}～{face_max:g} 萬，請調整保費"
                 )
+            if inputs.get("premium_net"):
+                converted = _solve_face_for_net_premium(doc, ip, op, inputs, converted)
             ip.getCellRangeByName("J39").setValue(converted)
         else:
             face_amount = float(inputs["face_amount_wan"])
@@ -1322,6 +1376,8 @@ def calculate_ul(product_code: str, inputs: dict, want_pdf: bool = False):
                 raise CalcError(
                     f"此保費換算保額約 {converted:g} 萬，超出本商品保額範圍 {face_min:g}～{face_max:g} 萬，請調整保費"
                 )
+            if inputs.get("premium_net"):
+                converted = _solve_face_for_net_premium(doc, ip, op, inputs, converted)
             ip.getCellRangeByName("J39").setValue(converted)
         else:
             ip.getCellRangeByName("J39").setValue(float(inputs["face_amount_wan"]))
