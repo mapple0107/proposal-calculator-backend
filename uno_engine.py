@@ -45,6 +45,7 @@ PRODUCT_TEMPLATE = {
     "SDH": "SDH.xlsx",
     "SDJ": "SDJ.xlsx",
     "SDN": "SDN.xlsx",
+    "SDKA": "SDKA.xlsx",
     "CIA": "CIA.xlsx",
     "CIB": "CIB.xlsx",
 }
@@ -79,6 +80,7 @@ PRODUCT_FAMILY = {
     "SDH": "SD",
     "SDJ": "SD",
     "SDN": "SD",
+    "SDKA": "SDK",
     "CIA": "CI",
     "CIB": "CI",
 }
@@ -211,6 +213,8 @@ def _calculate_unlocked(product_code: str, inputs: dict, want_pdf: bool = False)
         return calculate_ltqt(product_code, inputs, want_pdf=want_pdf)
     if family == "SD":
         return calculate_sd(product_code, inputs, want_pdf=want_pdf)
+    if family == "SDK":
+        return calculate_sdk(product_code, inputs, want_pdf=want_pdf)
     if family == "CI":
         return calculate_ci(product_code, inputs, want_pdf=want_pdf)
     if family == "UL":
@@ -1268,6 +1272,116 @@ def calculate_sd(product_code: str, inputs: dict, want_pdf: bool = False):
         except OSError:
             pass
 
+
+
+# ============================================================
+# SDKA 醫靠安心重大傷病定期健康保險（新臺幣，10 年期定期，每 10 年保證續保）
+#
+# 官方檔為「十在好漾專案組合試算表」：同一份輸入頁上有 AIJ（安心好漾定期壽險，OP）
+# 與 SDKA（OP1）兩張主約。本工具只試算 SDKA：AIJ 保額（J21）維持空白＝不投保，
+# SDKA 的輸入在第 30～34 列（繳別 D30、首期/續期繳費方式 Q30/Q32、險種 D34、保額 J34）。
+# 年度明細取自「Total」：B 年度、C 年齡、E SDKA 年度保費、U 身故/完全失能保險金、
+# V 特定重大疾病保險金、W 解約金；保費取 OP1。
+# 滿期無理賠回饋保險金＝Total!I12（OP1!C31，等於一年的應繳保費）。
+# ============================================================
+def calculate_sdk(product_code: str, inputs: dict, want_pdf: bool = False):
+    code = product_code.upper()
+    term = int(inputs.get("payment_term") or 10)
+    if term != 10:
+        raise CalcError("繳費年期限 10 年")
+    src_path = os.path.join(TEMPLATE_DIR, PRODUCT_TEMPLATE[code])
+    if not os.path.exists(src_path):
+        raise CalcError(f"找不到範本檔案: {PRODUCT_TEMPLATE[code]}")
+    fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", dir="/tmp")
+    os.close(fd)
+    shutil.copyfile(src_path, tmp_path)
+
+    desktop = _connect()
+    doc = desktop.loadComponentFromURL("file://" + tmp_path, "_blank", 0, (_mkprop("Hidden", True),))
+    try:
+        sheets = doc.getSheets()
+        ip = sheets.getByName("輸入頁")
+        op1 = sheets.getByName("OP1")
+        total = sheets.getByName("Total")
+
+        ip.getCellRangeByName("E5").setString(inputs.get("name", "客戶"))
+        ip.getCellRangeByName("K5").setString(inputs.get("gender", "女"))
+        ip.getCellRangeByName("E7").setValue(
+            _roc_birth_int(int(inputs["birth_year"]), int(inputs["birth_month"]), int(inputs["birth_day"]))
+        )
+        ip.getCellRangeByName("E12").setString(inputs.get("relationship", "同被保險人"))
+        ip.getCellRangeByName("J21").setString("")          # AIJ 不投保
+        freq = inputs.get("payment_freq", "年繳")
+        ip.getCellRangeByName("D17").setString(freq)
+        ip.getCellRangeByName("D30").setString(freq)
+        ip.getCellRangeByName("Q30").setString(inputs.get("first_payment_method", "匯款"))
+        ip.getCellRangeByName("Q32").setString(inputs.get("renewal_payment_method", "金融機構轉帳"))
+        ip.getCellRangeByName("D34").setString(f"{term}{code}")
+        ip.getCellRangeByName("J34").setValue(float(inputs["face_amount_wan"]))
+        doc.calculateAll()
+
+        age = op1.getCellRangeByName("D5").getValue()
+        age_min = op1.getCellRangeByName("C16").getValue()
+        age_max = op1.getCellRangeByName("C15").getValue()
+        if not (age_min <= age <= age_max):
+            raise CalcError(f"投保年齡超出範圍：本商品限保險年齡 {age_min:g}～{age_max:g} 歲（目前 {age:g} 歲）")
+        face_min = op1.getCellRangeByName("C26").getValue()
+        face_max = op1.getCellRangeByName("C27").getValue()
+        face = op1.getCellRangeByName("C28").getValue()
+        if not (face_min <= face <= face_max):
+            raise CalcError(f"保額超出範圍：本商品限 {face_min:g}～{face_max:g} 萬（目前 {face:g} 萬）")
+
+        premiums = {
+            "first_period_premium": op1.getCellRangeByName("C48").getValue(),
+            "renewal_period_premium": op1.getCellRangeByName("C49").getValue(),
+            "first_year_premium": op1.getCellRangeByName("C51").getValue(),
+            "renewal_year_premium": op1.getCellRangeByName("C52").getValue(),
+            "final_face_amount_wan": face,
+            "annual_premium_gross": op1.getCellRangeByName("C35").getValue(),
+            "insurance_age": age,
+            "no_claim_benefit": total.getCellRangeByName("I12").getValue(),
+        }
+        if premiums["annual_premium_gross"] <= 0:
+            raise CalcError("輸入條件超出本商品承保範圍，請確認後再試")
+
+        rows, cum = [], 0
+        for r in range(21, 21 + term):
+            prem = total.getCellRangeByName(f"E{r}").getValue()
+            cum += prem
+            rows.append({
+                "policy_year": total.getCellRangeByName(f"B{r}").getValue(),
+                "age": total.getCellRangeByName(f"C{r}").getValue(),
+                "annual_premium": prem,
+                "cum_premium": cum,
+                "death_benefit": total.getCellRangeByName(f"U{r}").getValue(),
+                "specific_disease_benefit": total.getCellRangeByName(f"V{r}").getValue(),
+                "cash_value": total.getCellRangeByName(f"W{r}").getValue(),
+            })
+
+        pdf_path = None
+        if want_pdf:
+            fd2, pdf_path = tempfile.mkstemp(suffix=".pdf", dir="/tmp")
+            os.close(fd2)
+            print_sheet = sheets.getByName("列印頁")
+            doc.getCurrentController().setActiveSheet(print_sheet)
+            page_style = doc.getStyleFamilies().getByName("PageStyles").getByName(print_sheet.PageStyle)
+            page_style.ScaleToPagesX = 1
+            page_style.ScaleToPagesY = 0
+            # 第 1 頁是輸入頁，從第 2 頁起才是建議書（列印頁）
+            filter_data = uno.Any("[]com.sun.star.beans.PropertyValue", (_mkprop("PageRange", "2-"),))
+            doc.storeToURL("file://" + pdf_path, (
+                _mkprop("FilterName", "calc_pdf_Export"),
+                _mkprop("SelectionOnly", False),
+                _mkprop("FilterData", filter_data),
+            ))
+
+        return {"premiums": premiums, "tables": {"main": {"label": "保單年度明細", "rows": rows}}}, pdf_path
+    finally:
+        doc.close(False)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
 # ============================================================
 # 利變型保單（外幣利率變動型終身壽險）：FBM / FBO / FBX / FBV
