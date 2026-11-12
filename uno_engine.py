@@ -45,6 +45,7 @@ PRODUCT_TEMPLATE = {
     "SDH": "SDH.xlsx",
     "SDJ": "SDJ.xlsx",
     "SDN": "SDN.xlsx",
+    "SDP": "SDP.xlsx",
     "SDKA": "SDKA.xlsx",
     "CIA": "CIA.xlsx",
     "CIB": "CIB.xlsx",
@@ -80,6 +81,7 @@ PRODUCT_FAMILY = {
     "SDH": "SD",
     "SDJ": "SD",
     "SDN": "SD",
+    "SDP": "SD",
     "SDKA": "SDK",
     "CIA": "CI",
     "CIB": "CI",
@@ -1133,6 +1135,17 @@ SD_CONFIGS = {
         "header_row": 22, "terminal_age_cell": "C57",
         "column_map": SD_COLUMN_MAP_WITH_MATURITY,
     },
+    # SDP 溢卡呵護重大傷病保險：版型同 SDN；R 欄為「生存保險金」（沿用 maturity_benefit 欄位）
+    # 繳費 10/15/20/30 年，保險期間＝繳費年期＋35 年
+    "SDP": {
+        "name_cell": "E5", "gender_cell": "K5", "birth_cell": "E7",
+        "relationship_cell": "E12", "payment_freq_cell": "E17",
+        "first_payment_cell": "Q17", "renewal_payment_cell": "Q19",
+        "discount_cell": "E20",
+        "payment_term_cell": "D33", "face_amount_cell": "J35",
+        "header_row": 22, "terminal_age_cell": "C57",
+        "column_map": SD_COLUMN_MAP_WITH_MATURITY,
+    },
 }
 
 
@@ -1203,6 +1216,19 @@ def calculate_sd(product_code: str, inputs: dict, want_pdf: bool = False):
             "insurance_age": insurance_age,
         }
 
+        if premiums["annual_premium_gross"] <= 0:
+            # 超出承保範圍時官方試算表保費為 0，改回傳明確的錯誤訊息
+            age_min = op.getCellRangeByName("C16").getValue()
+            age_max = op.getCellRangeByName("C15").getValue()
+            if not (age_min <= insurance_age <= age_max):
+                raise CalcError(f"投保年齡超出範圍：此繳費年期限保險年齡 {age_min:g}～{age_max:g} 歲（目前 {insurance_age:g} 歲）")
+            face_min = op.getCellRangeByName("C26").getValue()
+            face_max = op.getCellRangeByName("C27").getValue()
+            face = op.getCellRangeByName("C28").getValue()
+            if not (face_min <= face <= face_max):
+                raise CalcError(f"保額超出範圍：此年齡限 {face_min:g}～{face_max:g} 萬（目前 {face:g} 萬）")
+            raise CalcError("輸入條件超出本商品承保範圍，請確認後再試")
+
         print_sheet = sheets.getByName("列印頁")
 
         def is_data_cell(cell):
@@ -1223,7 +1249,8 @@ def calculate_sd(product_code: str, inputs: dict, want_pdf: bool = False):
             return cell.getValue() if is_data_cell(cell) else None
 
         rows = []
-        if insurance_age and insurance_age > 0 and terminal_age and terminal_age > 0:
+        # 0 歲（未滿 1 歲）也是合法的保險年齡，不能用 insurance_age > 0 判斷
+        if insurance_age is not None and insurance_age >= 0 and terminal_age and terminal_age > 0:
             expected_years = int(terminal_age - insurance_age + 1)
             r = config["header_row"] + 2  # 跳過表頭列＋子表頭列，資料從此列開始
             scanned = 0
